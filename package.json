@@ -10,6 +10,7 @@
 		"typecheck": "tsc --noEmit && svelte-check --diagnostic-sources js,svelte --fail-on-warnings"
 	},
 	"dependencies": {
+		"axios": "^1.20.0",
 		"gpuix-svelte": "^0.2.0"
 	},
 	"devDependencies": {

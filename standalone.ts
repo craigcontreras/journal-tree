@@ -2,9 +2,13 @@
 // component statically and mounts it with `render`.
 import { render } from 'gpuix-svelte';
 import App from './App.svelte';
+import { startBackend } from './lib/backend-process.ts';
+
+await startBackend();
 
 render(App, {
-	title: 'gpuix-svelte starter',
-	width: 640,
-	height: 480
+	title: 'Journal Tree',
+	width: 1280,
+	height: 720,
+	titlebarTransparent: true
 });
