@@ -35,4 +35,4 @@ def extract_topics():
     })
 
 if __name__ == "__main__":
-    serve(app, host="127.0.0.1", port=8765)
+    serve(app, host="127.0.0.1", port=0, use_reloader=False)
