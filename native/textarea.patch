@@ -1,0 +1,1024 @@
+--- a/packages/native/src/custom_elements/input.rs
++++ b/packages/native/src/custom_elements/input.rs
+@@ -23,6 +23,8 @@
+ use unicode_segmentation::UnicodeSegmentation;
+ use web_time::Instant;
+ 
++use super::markdown_blocks::{indent_lines, list_newline};
++use super::markdown_input::{shape_lines, smart_em_dash, MarkdownCache, Projection};
+ use super::{CustomElement, CustomElementFactory, CustomRenderContext};
+ use crate::renderer::{emit_event_full, EventCallback};
+ use crate::theme::Theme;
+@@ -63,6 +65,9 @@
+         Undo,
+         Redo,
+         Newline,
++        PlainNewline,
++        Indent,
++        Outdent,
+         Submit,
+     ]
+ );
+@@ -70,6 +75,7 @@
+ const INPUT_KEY_CONTEXT: &str = "GpuixInput";
+ const TEXTAREA_KEY_CONTEXT: &str = "GpuixTextarea";
+ const TEXTAREA_SUBMIT_KEY_CONTEXT: &str = "GpuixTextareaSubmit";
++const MARKDOWN_KEY_CONTEXT: &str = "GpuixMarkdownTextarea";
+ const CARET_BLINK_MS: u64 = 500;
+ const CARET_WIDTH: Pixels = px(2.0);
+ const DRAG_SCROLL_FRAME_MS: u64 = 16;
+@@ -177,6 +183,18 @@
+         word_navigation_uses_alt,
+         bind_paste_shortcut,
+     ));
++    let mut markdown_bindings = text_editor_bindings(
++        MARKDOWN_KEY_CONTEXT,
++        true,
++        false,
++        word_navigation_uses_alt,
++        bind_paste_shortcut,
++    );
++    markdown_bindings.extend([
++        KeyBinding::new("tab", Indent, Some(MARKDOWN_KEY_CONTEXT)),
++        KeyBinding::new("shift-tab", Outdent, Some(MARKDOWN_KEY_CONTEXT)),
++    ]);
++    bindings.extend(markdown_bindings);
+     cx.bind_keys(bindings);
+ }
+ 
+@@ -194,7 +212,11 @@
+         } else {
+             KeyBinding::new("enter", Newline, context)
+         },
+-        KeyBinding::new("shift-enter", Newline, context),
++        if context == Some(MARKDOWN_KEY_CONTEXT) {
++            KeyBinding::new("shift-enter", PlainNewline, context)
++        } else {
++            KeyBinding::new("shift-enter", Newline, context)
++        },
+         KeyBinding::new("backspace", Backspace, context),
+         KeyBinding::new("delete", Delete, context),
+         KeyBinding::new("left", Left, context),
+@@ -309,6 +331,7 @@
+ 
+ struct TextEditorElement {
+     multiline: bool,
++    markdown: bool,
+     value: String,
+     placeholder: String,
+     read_only: bool,
+@@ -323,6 +346,7 @@
+     fn new(multiline: bool) -> Self {
+         Self {
+             multiline,
++            markdown: false,
+             value: String::new(),
+             placeholder: String::new(),
+             read_only: false,
+@@ -358,6 +382,9 @@
+                 let value = self.value.clone();
+                 let placeholder = self.placeholder.clone();
+                 let multiline = self.multiline;
++                let markdown = self.multiline && self.markdown;
++                let code_font = SharedString::from(self.theme.font_mono.clone());
++                let markdown_theme = self.theme.clone();
+                 let read_only = self.read_only;
+                 let min_rows = self.min_rows;
+                 let max_rows = self.max_rows;
+@@ -377,6 +404,12 @@
+                     content: value,
+                     placeholder: placeholder.into(),
+                     multiline,
++                    markdown,
++                    markdown_cache: MarkdownCache::default(),
++                    display_map: None,
++                    markdown_theme,
++                    image_cache: std::collections::HashMap::new(),
++                    code_font,
+                     read_only,
+                     min_rows,
+                     max_rows,
+@@ -391,6 +424,7 @@
+                     scroll_left: 0.0,
+                     follow_cursor: true,
+                     last_lines: Vec::new(),
++                    last_line_heights: Vec::new(),
+                     line_starts: vec![0],
+                     last_bounds: None,
+                     line_height: px(20.0),
+@@ -421,6 +455,9 @@
+             state.emits_key_up = emits_key_up;
+             state.placeholder = self.placeholder.clone().into();
+             state.read_only = self.read_only;
++            state.markdown = self.multiline && self.markdown;
++            state.code_font = self.theme.font_mono.clone().into();
++            state.markdown_theme = self.theme.clone();
+             state.min_rows = self.min_rows.max(1);
+             state.max_rows = self.max_rows.max(state.min_rows);
+             if state.caret_color != self.theme.caret {
+@@ -514,6 +551,7 @@
+             "value" => self.value = value.as_str().unwrap_or_default().to_string(),
+             "placeholder" => self.placeholder = value.as_str().unwrap_or_default().to_string(),
+             "readOnly" => self.read_only = value.as_bool().unwrap_or(false),
++            "markdown" => self.markdown = value.as_bool().unwrap_or(false),
+             "minRows" => self.min_rows = value.as_u64().unwrap_or(1) as usize,
+             "maxRows" => {
+                 self.max_rows = value
+@@ -531,6 +569,7 @@
+             "value",
+             "placeholder",
+             "readOnly",
++            "markdown",
+             "minRows",
+             "maxRows",
+             "theme",
+@@ -639,6 +678,12 @@
+     content: String,
+     placeholder: SharedString,
+     multiline: bool,
++    markdown: bool,
++    markdown_cache: MarkdownCache,
++    display_map: Option<Projection>,
++    markdown_theme: Theme,
++    image_cache: std::collections::HashMap<String, gpui::ImageSource>,
++    code_font: SharedString,
+     read_only: bool,
+     min_rows: usize,
+     max_rows: usize,
+@@ -653,6 +698,7 @@
+     scroll_left: f32,
+     follow_cursor: bool,
+     last_lines: Vec<WrappedLine>,
++    last_line_heights: Vec<Pixels>,
+     line_starts: Vec<usize>,
+     last_bounds: Option<Bounds<Pixels>>,
+     line_height: Pixels,
+@@ -1124,8 +1170,44 @@
+ 
+     fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
+         if self.multiline && !self.read_only {
++            if self.markdown && self.marked_range.is_none() {
++                if let Some(edit) = list_newline(&self.content, &self.selected_range) {
++                    let range = self.range_to_utf16(&edit.range);
++                    self.replace_text_in_range(Some(range), &edit.text, window, cx);
++                    self.last_edit = None;
++                    return;
++                }
++            }
+             self.replace_text_in_range(None, "\n", window, cx);
+         }
++    }
++
++    fn plain_newline(&mut self, _: &PlainNewline, window: &mut Window, cx: &mut Context<Self>) {
++        if self.multiline && !self.read_only {
++            self.replace_text_in_range(None, "\n", window, cx);
++        }
++    }
++
++    fn change_indent(&mut self, outdent: bool, window: &mut Window, cx: &mut Context<Self>) {
++        if !self.markdown || self.read_only || self.marked_range.is_some() {
++            return;
++        }
++        if let Some(change) = indent_lines(&self.content, &self.selected_range, outdent) {
++            let reversed = self.selection_reversed;
++            let range = self.range_to_utf16(&change.edit.range);
++            self.replace_text_in_range(Some(range), &change.edit.text, window, cx);
++            self.selected_range = change.selection;
++            self.selection_reversed = reversed;
++            self.last_edit = None;
++        }
++    }
++
++    fn indent(&mut self, _: &Indent, window: &mut Window, cx: &mut Context<Self>) {
++        self.change_indent(false, window, cx);
++    }
++
++    fn outdent(&mut self, _: &Outdent, window: &mut Window, cx: &mut Context<Self>) {
++        self.change_indent(true, window, cx);
+     }
+ 
+     fn submit(&mut self, _: &Submit, _: &mut Window, _: &mut Context<Self>) {
+@@ -1134,7 +1216,12 @@
+ 
+     fn vertical_target(&self, direction: f32) -> Option<usize> {
+         let current = self.point_for_index(self.cursor_offset())?;
+-        let target_y = f32::from(current.y) + direction * f32::from(self.line_height);
++        let target_y = f32::from(current.y)
++            + if direction < 0.0 {
++                -0.5
++            } else {
++                f32::from(self.height_for_index(self.cursor_offset())) + 0.5
++            };
+         if target_y < 0.0 {
+             return Some(0);
+         }
+@@ -1145,21 +1232,56 @@
+     }
+ 
+     fn point_for_index(&self, index: usize) -> Option<Point<Pixels>> {
++        let index = self
++            .display_map
++            .as_ref()
++            .map_or(index, |map| map.to_display(index));
+         for (line_index, line) in self.last_lines.iter().enumerate() {
+             let line_start = *self.line_starts.get(line_index)?;
+             if index < line_start || index > line_start + line.len() {
+                 continue;
+             }
+-            let local = line.position_for_index(index - line_start, self.line_height)?;
++            let local =
++                line.position_for_index(index - line_start, self.line_height_at(line_index))?;
+             let y_offset: Pixels = self
+                 .last_lines
+                 .iter()
+                 .take(line_index)
+-                .map(|line| line.size(self.line_height).height)
++                .enumerate()
++                .map(|(index, line)| line.size(self.line_height_at(index)).height)
+                 .sum();
+             return Some(point(local.x, local.y + y_offset));
+         }
+         None
++    }
++
++    fn line_height_at(&self, index: usize) -> Pixels {
++        self.last_line_heights
++            .get(index)
++            .copied()
++            .unwrap_or(self.line_height)
++    }
++
++    fn image_height(&self, width: Pixels) -> Pixels {
++        let height = self
++            .markdown_theme
++            .metrics
++            .md_editor_image_height
++            .min(f32::from(width.max(self.line_height)));
++        px((height / f32::from(self.line_height)).ceil() * f32::from(self.line_height))
++    }
++
++    fn height_for_index(&self, index: usize) -> Pixels {
++        let display = self
++            .display_map
++            .as_ref()
++            .map_or(index, |map| map.to_display(index));
++        self.line_starts
++            .iter()
++            .enumerate()
++            .rev()
++            .find(|(_, start)| **start <= display)
++            .map_or(self.line_height, |(index, _)| self.line_height_at(index))
+     }
+ 
+     fn index_for_point(&self, position: Point<Pixels>) -> usize {
+@@ -1168,14 +1290,20 @@
+         }
+         let mut y = f32::from(position.y).max(0.0);
+         for (line_index, line) in self.last_lines.iter().enumerate() {
+-            let height = f32::from(line.size(self.line_height).height);
++            let height = f32::from(line.size(self.line_height_at(line_index)).height);
+             let line_start = self.line_starts.get(line_index).copied().unwrap_or(0);
+             if y < height || line_index + 1 == self.last_lines.len() {
+                 let local = point(position.x, px(y.min(height - 1.0).max(0.0)));
+                 let index = line
+-                    .closest_index_for_position(local, self.line_height)
++                    .closest_index_for_position(local, self.line_height_at(line_index))
+                     .unwrap_or_else(|index| index);
+-                return (line_start + index).min(self.content.len());
++                let display_index = line_start + index;
++                return self
++                    .display_map
++                    .as_ref()
++                    .map_or(display_index.min(self.content.len()), |map| {
++                        map.to_source(display_index)
++                    });
+             }
+             y -= height;
+         }
+@@ -1198,6 +1326,19 @@
+         window: &mut Window,
+         cx: &mut Context<Self>,
+     ) {
++        if self.markdown && (event.modifiers.platform || event.modifiers.control) {
++            if let Some(url) = self
++                .markdown_cache
++                .link_at(self.index_for_mouse_position(event.position))
++            {
++                if let Ok(url) = url::Url::parse(url) {
++                    if matches!(url.scheme(), "https" | "http" | "mailto" | "file") {
++                        cx.open_url(url.as_str());
++                        return;
++                    }
++                }
++            }
++        }
+         if !self.read_only {
+             window.request_text_input();
+         }
+@@ -1326,12 +1467,21 @@
+         };
+         let viewport_height = f32::from(bounds.size.height);
+         let max_scroll = (self.content_height - viewport_height).max(0.0);
+-        if max_scroll == 0.0 {
++        let max_horizontal = if self.markdown {
++            (self.content_width - f32::from(bounds.size.width)).max(0.0)
++        } else {
++            0.0
++        };
++        if max_scroll == 0.0 && max_horizontal == 0.0 {
+             return;
+         }
+-        let delta = f32::from(event.delta.pixel_delta(self.line_height).y);
++        let movement = event.delta.pixel_delta(self.line_height);
++        let horizontal = (self.scroll_left - f32::from(movement.x)).clamp(0.0, max_horizontal);
++        let horizontal_changed = horizontal != self.scroll_left;
++        self.scroll_left = horizontal;
++        let delta = f32::from(movement.y);
+         let next = (self.scroll_top - delta).clamp(0.0, max_scroll);
+-        if next == self.scroll_top {
++        if next == self.scroll_top && !horizontal_changed {
+             if delta != 0.0 {
+                 cx.stop_propagation();
+             }
+@@ -1378,7 +1528,7 @@
+     }
+ 
+     fn layout_text(&mut self, width: Pixels, style: &TextStyle, window: &mut Window) -> f32 {
+-        let (display, is_placeholder) = if self.content.is_empty() {
++        let (mut display, is_placeholder) = if self.content.is_empty() {
+             (self.placeholder.clone(), true)
+         } else {
+             (SharedString::from(self.content.clone()), false)
+@@ -1407,40 +1557,92 @@
+             }),
+             strikethrough: None,
+         };
+-        let runs = match self.marked_range.as_ref() {
+-            Some(marked) if !is_placeholder => vec![
+-                run(marked.start, false),
+-                run(marked.len(), true),
+-                run(display.len() - marked.end, false),
+-            ]
+-            .into_iter()
+-            .filter(|run| run.len > 0)
+-            .collect(),
+-            _ => vec![run(display.len(), false)],
++        let runs = if self.markdown && !is_placeholder {
++            let image_rows =
++                (f32::from(self.image_height(width)) / f32::from(self.line_height)) as usize;
++            let projection = self.markdown_cache.project_with_rows(
++                &display,
++                &self.selected_range,
++                self.marked_range.as_ref(),
++                image_rows,
++            );
++            let source_runs = self.markdown_cache.runs_themed(
++                &display,
++                style.font(),
++                color,
++                &self.code_font,
++                self.marked_range.as_ref(),
++                &self.markdown_theme,
++            );
++            let runs = projection.project_runs(source_runs);
++            display = projection.text.clone();
++            self.display_map = Some(projection);
++            self.image_cache
++                .retain(|src, _| self.markdown_cache.has_image(src));
++            runs
++        } else {
++            self.display_map = None;
++            self.image_cache.clear();
++            match self.marked_range.as_ref() {
++                Some(marked) if !is_placeholder => vec![
++                    run(marked.start, false),
++                    run(marked.len(), true),
++                    run(display.len() - marked.end, false),
++                ]
++                .into_iter()
++                .filter(|run| run.len > 0)
++                .collect(),
++                _ => vec![run(display.len(), false)],
++            }
+         };
+         let wrap_width = self.multiline.then_some(width);
+-        let lines = window
+-            .text_system()
+-            .shape_text(display, font_size, &runs, wrap_width, None)
+-            .map(|lines| lines.into_vec())
+-            .unwrap_or_default();
+-        let mut line_starts = Vec::with_capacity(lines.len());
+-        let mut offset = 0;
+-        for line in &lines {
+-            line_starts.push(offset);
+-            offset += line.len() + 1;
+-        }
+-        if line_starts.is_empty() {
+-            line_starts.push(0);
+-        }
++        let (lines, line_starts, line_heights) = if let Some(map) = &self.display_map {
++            shape_lines(
++                &display,
++                &runs,
++                font_size,
++                self.line_height,
++                width,
++                &self.markdown_cache,
++                map,
++                &self.markdown_theme.metrics,
++                window,
++            )
++        } else {
++            let lines = window
++                .text_system()
++                .shape_text(display, font_size, &runs, wrap_width, None)
++                .map(|lines| lines.into_vec())
++                .unwrap_or_default();
++            let mut line_starts = Vec::with_capacity(lines.len());
++            let mut offset = 0;
++            for line in &lines {
++                line_starts.push(offset);
++                offset += line.len() + 1;
++            }
++            if line_starts.is_empty() {
++                line_starts.push(0);
++            }
++            let line_heights = vec![self.line_height; lines.len()];
++            (lines, line_starts, line_heights)
++        };
++        self.last_line_heights = line_heights;
+         self.content_height = lines
+             .iter()
+-            .map(|line| f32::from(line.size(self.line_height).height))
++            .enumerate()
++            .map(|(index, line)| f32::from(line.size(self.line_height_at(index)).height))
+             .sum::<f32>()
+             .max(f32::from(self.line_height));
+         self.content_width = lines
+             .iter()
+-            .map(|line| f32::from(line.unwrapped_layout.width))
++            .enumerate()
++            .map(|(index, line)| {
++                f32::from(if self.markdown {
++                    line.size(self.line_height_at(index)).width
++                } else {
++                    line.unwrapped_layout.width
++                })
++            })
+             .fold(0.0, f32::max);
+         self.display_is_placeholder = is_placeholder;
+         self.last_lines = lines;
+@@ -1454,12 +1656,14 @@
+                 let cursor_top = f32::from(cursor.y);
+                 if cursor_top < self.scroll_top {
+                     self.scroll_top = cursor_top;
+-                } else if cursor_top + f32::from(self.line_height)
++                } else if cursor_top + f32::from(self.height_for_index(self.cursor_offset()))
+                     > self.scroll_top + viewport_height
+                 {
+-                    self.scroll_top = cursor_top + f32::from(self.line_height) - viewport_height;
++                    self.scroll_top = cursor_top
++                        + f32::from(self.height_for_index(self.cursor_offset()))
++                        - viewport_height;
+                 }
+-                if !self.multiline {
++                if !self.multiline || self.markdown {
+                     let cursor_left = f32::from(cursor.x);
+                     if cursor_left < self.scroll_left {
+                         self.scroll_left = cursor_left;
+@@ -1472,7 +1676,7 @@
+         self.scroll_top = self
+             .scroll_top
+             .clamp(0.0, (self.content_height - viewport_height).max(0.0));
+-        self.scroll_left = if self.multiline {
++        self.scroll_left = if self.multiline && !self.markdown {
+             0.0
+         } else {
+             self.scroll_left
+@@ -1542,8 +1746,24 @@
+         }
+         self.content =
+             self.content[..range.start].to_owned() + &replacement + &self.content[range.end..];
+-        let cursor = range.start + replacement.len();
++        let mut cursor = range.start + replacement.len();
+         self.selected_range = cursor..cursor;
++        if self.markdown
++            && self.marked_range.is_none()
++            && range_utf16.is_none()
++            && range.is_empty()
++            && new_text == "-"
++        {
++            if let Some(edit) = smart_em_dash(&self.content, cursor) {
++                // Snapshot the two literal hyphens so one Undo can cancel
++                // the substitution independently of the user's typing.
++                self.record_edit(&edit.range, &edit.text, cx.background_executor().now());
++                self.content.replace_range(edit.range.clone(), &edit.text);
++                cursor = edit.range.start + edit.text.len();
++                self.selected_range = cursor..cursor;
++                self.last_edit = None;
++            }
++        }
+         self.selection_reversed = false;
+         self.marked_range = None;
+         self.follow_cursor = true;
+@@ -1610,7 +1830,7 @@
+                 bounds.left() + start.x - px(self.scroll_left),
+                 bounds.top() + start.y - px(self.scroll_top),
+             ),
+-            self.line_height,
++            self.height_for_index(range.start),
+         ))
+     }
+ 
+@@ -1655,6 +1875,8 @@
+                 INPUT_KEY_CONTEXT
+             } else if self.emits_submit {
+                 TEXTAREA_SUBMIT_KEY_CONTEXT
++            } else if self.markdown {
++                MARKDOWN_KEY_CONTEXT
+             } else {
+                 TEXTAREA_KEY_CONTEXT
+             })
+@@ -1693,6 +1915,9 @@
+             .on_action(cx.listener(Self::undo))
+             .on_action(cx.listener(Self::redo))
+             .on_action(cx.listener(Self::newline))
++            .on_action(cx.listener(Self::plain_newline))
++            .on_action(cx.listener(Self::indent))
++            .on_action(cx.listener(Self::outdent))
+             .on_action(cx.listener(Self::submit))
+             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+@@ -1719,10 +1944,12 @@
+             })
+             .w_full()
+             .min_w_0()
++            .when(self.markdown, |editor| editor.h_full())
+             .child(EditorTextElement {
+                 input: cx.entity(),
+                 min_rows: self.min_rows,
+                 max_rows: self.max_rows,
++                fill_height: self.markdown,
+             })
+     }
+ }
+@@ -1731,11 +1958,13 @@
+     input: Entity<TextEditorState>,
+     min_rows: usize,
+     max_rows: usize,
++    fill_height: bool,
+ }
+ 
+ struct EditorPrepaint {
+     caret: Option<PaintQuad>,
+     selection: Vec<PaintQuad>,
++    images: Vec<gpui::AnyElement>,
+ }
+ 
+ impl gpui::Element for EditorTextElement {
+@@ -1759,10 +1988,14 @@
+     ) -> (LayoutId, ()) {
+         let mut style = Style::default();
+         style.size.width = relative(1.0).into();
++        if self.fill_height {
++            style.size.height = relative(1.0).into();
++        }
+         let input = self.input.clone();
+         let text_style = window.text_style();
+         let min_rows = self.min_rows;
+         let max_rows = self.max_rows.max(min_rows);
++        let fill_height = self.fill_height;
+         let layout = window.request_measured_layout(style, move |known, available, window, cx| {
+             let width = known.width.unwrap_or(match available.width {
+                 gpui::AvailableSpace::Definite(width) => width,
+@@ -1772,8 +2005,13 @@
+                 let content_height = input.layout_text(width, &text_style, window);
+                 (content_height, f32::from(input.line_height))
+             });
+-            let height =
++            let natural_height =
+                 content_height.clamp(min_rows as f32 * line_height, max_rows as f32 * line_height);
++            let height = if fill_height {
++                known.height.map(f32::from).unwrap_or(natural_height)
++            } else {
++                natural_height
++            };
+             size(width, px(height))
+         });
+         (layout, ())
+@@ -1785,7 +2023,7 @@
+         _: Option<&gpui::InspectorElementId>,
+         bounds: Bounds<Pixels>,
+         _: &mut (),
+-        _: &mut Window,
++        window: &mut Window,
+         cx: &mut App,
+     ) -> EditorPrepaint {
+         self.input.update(cx, |input, _| {
+@@ -1806,7 +2044,7 @@
+             caret = Some(fill(
+                 caret_rect(
+                     point(origin.x + caret_point.x, origin.y + caret_point.y),
+-                    input.line_height,
++                    input.height_for_index(input.cursor_offset()),
+                 ),
+                 input.caret_color,
+             ));
+@@ -1819,7 +2057,10 @@
+                 selection.push(fill(
+                     Bounds::from_corners(
+                         point(origin.x + start.x, origin.y + start.y),
+-                        point(origin.x + end.x, origin.y + start.y + input.line_height),
++                        point(
++                            origin.x + end.x,
++                            origin.y + start.y + input.height_for_index(input.selected_range.start),
++                        ),
+                     ),
+                     color,
+                 ));
+@@ -1827,14 +2068,22 @@
+                 selection.push(fill(
+                     Bounds::from_corners(
+                         point(origin.x + start.x, origin.y + start.y),
+-                        point(bounds.right(), origin.y + start.y + input.line_height),
++                        point(
++                            bounds.right(),
++                            origin.y + start.y + input.height_for_index(input.selected_range.start),
++                        ),
+                     ),
+                     color,
+                 ));
+-                if end.y > start.y + input.line_height {
++                if end.y > start.y + input.height_for_index(input.selected_range.start) {
+                     selection.push(fill(
+                         Bounds::from_corners(
+-                            point(origin.x, origin.y + start.y + input.line_height),
++                            point(
++                                origin.x,
++                                origin.y
++                                    + start.y
++                                    + input.height_for_index(input.selected_range.start),
++                            ),
+                             point(bounds.right(), origin.y + end.y),
+                         ),
+                         color,
+@@ -1843,13 +2092,107 @@
+                 selection.push(fill(
+                     Bounds::from_corners(
+                         point(origin.x, origin.y + end.y),
+-                        point(origin.x + end.x, origin.y + end.y + input.line_height),
++                        point(
++                            origin.x + end.x,
++                            origin.y + end.y + input.height_for_index(input.selected_range.end),
++                        ),
+                     ),
+                     color,
+                 ));
+             }
+         }
+-        EditorPrepaint { caret, selection }
++        let image_specs: Vec<_> = input
++            .display_map
++            .as_ref()
++            .into_iter()
++            .flat_map(|map| &map.images)
++            .filter_map(|image| {
++                let position = input.point_for_index(image.range.start)?;
++                let top = origin.y + position.y + input.line_height;
++                let height = input.image_height(bounds.size.width);
++                (top < bounds.bottom() && top + height > bounds.top()).then_some((
++                    image.clone(),
++                    point(origin.x + position.x, top),
++                    height,
++                    (bounds.size.width - position.x).max(px(1.0)),
++                    input.element_id,
++                ))
++            })
++            .collect();
++        let mut images = Vec::new();
++        for (image, origin, height, width, element_id) in image_specs {
++            let src = self.input.update(cx, |input, _| {
++                input
++                    .image_cache
++                    .entry(image.src.clone())
++                    .or_insert_with(|| {
++                        let parsed = url::Url::parse(&image.src).ok();
++                        let normalized = parsed
++                            .as_ref()
++                            .map_or(image.src.as_str(), |url| url.as_str());
++                        if normalized.starts_with("data:") {
++                            if let Some((format, bytes)) =
++                                super::img::decode_image_data_url(normalized)
++                            {
++                                return gpui::ImageSource::from(std::sync::Arc::new(
++                                    gpui::Image::from_bytes(format, bytes),
++                                ));
++                            }
++                        }
++                        if normalized.starts_with("https://") || normalized.starts_with("http://") {
++                            gpui::ImageSource::from(gpui::SharedUri::from(normalized.to_owned()))
++                        } else {
++                            let path = parsed
++                                .and_then(|url| url.to_file_path().ok())
++                                .unwrap_or_else(|| {
++                                    std::path::PathBuf::from(
++                                        percent_encoding::percent_decode_str(&image.src)
++                                            .decode_utf8_lossy()
++                                            .into_owned(),
++                                    )
++                                });
++                            gpui::ImageSource::from(path)
++                        }
++                    })
++                    .clone()
++            });
++            let input = self.input.clone();
++            let source_start = image.range.start;
++            let mut element = gpui::img(src)
++                .id(SharedString::from(format!(
++                    "markdown-image-{element_id}-{source_start}"
++                )))
++                .w(width)
++                .h(height)
++                .aspect_ratio(f32::from(width) / f32::from(height))
++                .object_fit(gpui::ObjectFit::Contain)
++                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
++                    input.update(cx, |input, cx| {
++                        window.focus(&input.focus_handle, cx);
++                        input.selected_range = source_start..source_start;
++                        input.follow_cursor = true;
++                        cx.notify();
++                    });
++                })
++                .into_any_element();
++            window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
++                element.prepaint_as_root(
++                    origin,
++                    size(
++                        gpui::AvailableSpace::Definite(width),
++                        gpui::AvailableSpace::Definite(height),
++                    ),
++                    window,
++                    cx,
++                );
++            });
++            images.push(element);
++        }
++        EditorPrepaint {
++            caret,
++            selection,
++            images,
++        }
+     }
+ 
+     fn paint(
+@@ -1878,16 +2221,19 @@
+             for quad in prepaint.selection.drain(..) {
+                 window.paint_quad(quad);
+             }
+-            let (lines, line_height, scroll_top, scroll_left, display) =
++            let (lines, line_height, line_heights, scroll_top, scroll_left, display) =
+                 self.input.update(cx, |input, _| {
+                     let display = if input.content.is_empty() {
+                         input.placeholder.clone()
++                    } else if let Some(map) = &input.display_map {
++                        map.text.clone()
+                     } else {
+                         input.content.clone().into()
+                     };
+                     (
+                         std::mem::take(&mut input.last_lines),
+                         input.line_height,
++                        input.last_line_heights.clone(),
+                         input.scroll_top,
+                         input.scroll_left,
+                         display,
+@@ -1895,7 +2241,8 @@
+                 });
+             crate::text::log_painted_text(display);
+             let mut y = bounds.top() - px(scroll_top);
+-            for line in &lines {
++            for (index, line) in lines.iter().enumerate() {
++                let line_height = line_heights.get(index).copied().unwrap_or(line_height);
+                 let height = line.size(line_height).height;
+                 line.paint(
+                     point(bounds.left() - px(scroll_left), y),
+@@ -1909,6 +2256,9 @@
+                 y += height;
+             }
+             self.input.update(cx, |input, _| input.last_lines = lines);
++            for image in &mut prepaint.images {
++                image.paint(window, cx);
++            }
+             let caret_shown = self
+                 .input
+                 .update(cx, |input, cx| input.caret_shown(window, cx));
+--- a/packages/native/src/custom_elements/mod.rs
++++ b/packages/native/src/custom_elements/mod.rs
+@@ -19,6 +19,9 @@
+ pub mod img;
+ pub mod input;
+ pub mod markdown;
++mod markdown_input;
++mod markdown_blocks;
++mod markdown_syntax;
+ 
+ // ── Render context ───────────────────────────────────────────────────
+ 
+--- a/packages/native/src/custom_elements/img.rs
++++ b/packages/native/src/custom_elements/img.rs
+@@ -391,7 +391,7 @@
+     std::fs::read(src).ok()
+ }
+ 
+-fn decode_image_data_url(src: &str) -> Option<(gpui::ImageFormat, Vec<u8>)> {
++pub(super) fn decode_image_data_url(src: &str) -> Option<(gpui::ImageFormat, Vec<u8>)> {
+     let (metadata, data) = src.strip_prefix("data:")?.split_once(',')?;
+     let mut parts = metadata.split(';');
+     let mime_type = parts.next()?.to_ascii_lowercase();
+--- a/packages/native/src/theme.rs
++++ b/packages/native/src/theme.rs
+@@ -230,6 +230,7 @@
+     pub md_text_size: f32,
+     pub md_line_height: f32,
+     pub md_block_gap: f32,
++    pub md_editor_image_height: f32,
+     /// Font size for h1, h2, h3, and h4-h6.
+     pub md_heading_sizes: [f32; 4],
+     /// Line height for h1, h2, h3, and h4-h6.
+@@ -305,6 +306,7 @@
+         set(&mut self.md_text_size, o.md_text_size);
+         set(&mut self.md_line_height, o.md_line_height);
+         set(&mut self.md_block_gap, o.md_block_gap);
++        set(&mut self.md_editor_image_height, o.md_editor_image_height);
+         set(&mut self.md_table_cell_padding, o.md_table_cell_padding);
+         set(
+             &mut self.md_table_min_column_width,
+@@ -374,6 +376,7 @@
+             self.md_text_size,
+             self.md_line_height,
+             self.md_block_gap,
++            self.md_editor_image_height,
+             self.md_table_cell_padding,
+             self.md_table_min_column_width,
+             self.md_table_min_column_content,
+@@ -413,6 +416,7 @@
+             md_text_size: 14.0,
+             md_line_height: 22.0,
+             md_block_gap: 12.0,
++            md_editor_image_height: 180.0,
+             // Tight monochrome scale: headings step down quickly toward body
+             // size, so a document of h2s does not read as a wall of titles.
+             md_heading_sizes: [19.0, 16.0, 15.0, 14.0],
+@@ -687,6 +691,7 @@
+     pub md_text_size: Option<f64>,
+     pub md_line_height: Option<f64>,
+     pub md_block_gap: Option<f64>,
++    pub md_editor_image_height: Option<f64>,
+     /// `[h1, h2, h3, h4to6]`. A shorter array leaves the rest alone.
+     pub md_heading_sizes: Option<Vec<f64>>,
+     pub md_heading_line_heights: Option<Vec<f64>>,
+--- a/packages/native/js/host.ts
++++ b/packages/native/js/host.ts
+@@ -286,6 +286,7 @@
+   mdTextSize?: number
+   mdLineHeight?: number
+   mdBlockGap?: number
++  mdEditorImageHeight?: number
+   /** `[h1, h2, h3, h4to6]`. A shorter array leaves the rest at their defaults. */
+   mdHeadingSizes?: number[]
+   mdHeadingLineHeights?: number[]
+@@ -475,6 +476,8 @@
+ }
+ 
+ export interface TextareaProps extends InputProps {
++  /** Source-preserving native Markdown formatting; defaults to false. */
++  markdown?: boolean
+   minRows?: number
+   maxRows?: number
+ }
+--- a/packages/native/Cargo.toml
++++ b/packages/native/Cargo.toml
+@@ -31,6 +31,8 @@
+ pulldown-cmark = { version = "0.12", default-features = false }
+ unicode-segmentation = "1"
+ web-time = "1"
++linkify = "0.10"
++unicode-width = "0.2"
+ 
+ # Syntect compiles a grammar's TextMate regexes lazily, on the FIRST highlight
+ # of that language, on the frame thread, inside a paint. fancy-regex takes
+--- a/packages/native/Cargo.lock
++++ b/packages/native/Cargo.lock
+@@ -2603,6 +2603,7 @@
+  "gpui_platform",
+  "http_client",
+  "js-sys",
++ "linkify",
+  "log",
+  "minisign-verify",
+  "napi",
+@@ -2624,6 +2625,7 @@
+  "time",
+  "two-face",
+  "unicode-segmentation",
++ "unicode-width",
+  "url",
+  "wasm-bindgen",
+  "web-sys",
+@@ -3386,6 +3388,15 @@
+ version = "0.19.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "39c29a617ce3df32c08497bdc1ab6e2376e0b17948ac166a2fbe5977c5954cd9"
++
++[[package]]
++name = "linkify"
++version = "0.10.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f1dfa36d52c581e9ec783a7ce2a5e0143da6237be5811a0b3153fedfdbe9f780"
++dependencies = [
++ "memchr",
++]
+ 
+ [[package]]
+ name = "linktime-proc-macro"
+--- a/README.md
++++ b/README.md
+@@ -3374,6 +3374,57 @@
+ 
+ ## Documentation
+ 
++### Local native Markdown textarea extension
++
++This Journal Tree build adds an opt-in boolean `markdown` prop to `<textarea>`.
++It uses CommonMark with GFM tables, strikethrough, task lists, and autolinks.
++Native text runs and per-line metrics render inline formatting, headings,
++quotes, lists, code, rules, links, escapes, and entities. Tables use aligned
++monospace grids and horizontal scrolling; images use native GPUI image elements.
++Formatting markers hide outside the active word or block and reappear when the
++cursor or selection enters it. A source/display map preserves original source
++bytes and translates caret, selection, and mouse positions.
++Plain textareas keep their existing behavior. Cursor navigation, selection,
++undo, clipboard operations and IME still use the existing native editor. The
++extension preserves composition underlines across formatting boundaries.
++Markdown mode fills the defined viewport height for native caret scrolling.
++In Markdown mode, Tab indents the current or selected lines with a literal tab,
++painted at four-column stops without rewriting source. Shift-Tab removes one
++tab or up to four legacy spaces. Tab-indented paragraphs and lists retain their
++Markdown formatting instead of becoming implicit code blocks. Fenced and
++space-indented code remain available. Enter at the end of a list item carries
++its marker and indentation forward (incrementing ordered markers and resetting
++task boxes). Enter on an empty item removes its marker and indentation.
++Shift-Enter inserts a plain newline. List continuation does not run in code.
++An unordered marker followed by a space or tab immediately renders as `•`, even
++while its item is active. Enter-generated continuations also render immediately.
++Bare markers remain literal until completed. The source character and its byte
++offsets remain intact for editing, deletion, clipboard operations, and undo.
++Inside lists, a lone indented dash is treated as an empty bullet rather than a
++setext underline, so unfinished items retain normal fonts and line heights.
++Multi-dash/equal-sign setext headings are preserved. A single dash completed
++with a space takes bullet precedence after a paragraph; an uncompleted dash
++outside a list can still serve as a setext underline.
++Typing `--` after prose text substitutes an em dash (`—`), with a separate Undo
++step restoring the two literal hyphens. Code spans/blocks, escaped hyphens,
++URLs, and Markdown separators remain literal. Line-leading hyphens are kept
++for rules and underlines. Existing source and multi-character inserts are not
++rewritten; composition and explicit range replacements do not trigger it.
++Fenced code uses its info-string language label with the existing cached Syntect
++highlighter and `theme.syntax` palette, including during editing. Supported
++language aliases match `<code>`: JS/JSX, TS/TSX, Rust, Python, Go, JSON/JSONC,
++Bash, TOML, Markdown, HTML, CSS, YAML, and C. Missing/unknown labels, inline code,
++space-indented code, or blocks beyond the syntax engine's 512 KiB limit stay
++plain. Colours do not change fonts, layout, selection, source, or IME underlines.
++Raw HTML remains literal text. Table and image blocks reopen as editable source. Cmd/Ctrl-click
++opens supported links. Relative image paths use the process working directory.
++`theme.metrics.mdEditorImageHeight` controls preview height (default 180px,
++bounded by editor width); `mdHeadingSizes` and `mdHeadingLineHeights` control
++the existing four heading metric tiers. Obsidian extensions are not included.
++
++The native addon also exposes `journalTreeMarkdownVersion()` returning `3`,
++which the local launcher checks before starting the app.
++
+ See [AGENTS.md](https://github.com/remorses/gpuix/blob/main/AGENTS.md) for detailed architecture, communication flow, and contributing guide.
+ 
+ ## License
+--- /dev/null
++++ b/.changeset/native-markdown-textarea.md
+@@ -0,0 +1,17 @@
++---
++"@gpuix/native": patch
++---
++
++Add opt-in native CommonMark/GFM editing with cursor-aware source/display mapping, styled headings and text, lists/tasks/quotes, native images, aligned tables, links/autolinks, code blocks, and viewport scrolling for the local Journal Tree build. Preserve raw HTML as editable text.
++
++Support Tab/Shift-Tab indentation with preserved selections and undo, automatic list continuation on Enter, and removing empty list markers on Enter. Keep Shift-Enter as a plain newline.
++
++Keep empty nested dash bullets from applying setext heading fonts and metrics to the previous item while editing.
++
++Convert typed double hyphens after prose to an em dash with reversible Undo, preserving code, URLs, escapes, and Markdown separators.
++
++Use literal tabs for indentation, render four-column tab stops with source mapping, and keep tab-indented paragraphs and bullets from becoming implicit code blocks.
++
++Render completed unordered bullet prefixes immediately and keep them rendered while typing or continuing lists, preserving editable Markdown source.
++
++Highlight editable fenced code using its language label and the native cached Syntect engine, preserving source offsets, monospace layout, composition, and theme syntax colours.

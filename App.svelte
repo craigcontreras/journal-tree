@@ -3,6 +3,8 @@
 	import axios from "axios";
 	import { onMount } from "svelte";
 	import { set_css_vars } from "gpuix-svelte";
+	import MarkdownEditor from './MarkdownEditor.svelte';
+	import { editorState } from './lib/editor-state.svelte.ts';
 
 	set_css_vars({ surface: '#11111b', panel: '#1e1e2e', divider: '#1e1e2e', text: '#ffffff', 'editor-inset': '32px' });
 
@@ -42,7 +44,7 @@
 		<div class="sidebar" testid="left-sidebar"></div>
 		<div class="container" testid="editor-column">
 			<div class="card">
-				<textarea testid="editor"></textarea>
+				<MarkdownEditor value={editorState.source} onchange={(e) => editorState.source = e.value} />
 			</div>
 		</div>
 		<div class="sidebar"></div>
@@ -68,12 +70,6 @@
 		width: 15%;
 		height: 100%;
 		flex-shrink: 0;
-	}
-
-	textarea {
-		color: var(--text);
-		min-height: 100%;
-		width: 100%;
 	}
 
 	.app {

@@ -2,7 +2,11 @@
 // `bun build.ts` (npm run build): compiles standalone.ts into one executable for the platform it runs on.
 
 import type { BunPlugin } from 'bun';
-import { load_module, load_svelte, resolve_native_cjs, resolve_svelte } from 'gpuix-svelte/plugin';
+import { load_module, load_svelte, resolve_svelte } from 'gpuix-svelte/plugin';
+import { join } from 'node:path';
+import { assertNativeBuild, buildRoot } from './native/config.ts';
+
+assertNativeBuild();
 
 const conditions = ['custom-renderer', 'production'];
 const outfile = process.platform === 'win32' ? 'dist/app.exe' : 'dist/app';
@@ -12,7 +16,8 @@ let components = 0;
 const plugin: BunPlugin = {
 	name: 'gpuix-svelte',
 	setup(build) {
-		build.onResolve({ filter: /^@gpuix\/native$/ }, resolve_native_cjs);
+		// A literal .node import lets Bun embed our patched addon in the binary.
+		build.onResolve({ filter: /^@gpuix\/native$/ }, () => ({ path: join(buildRoot, 'standalone-binding.cjs') }));
 		build.onResolve({ filter: /^svelte(\/|$)/ }, resolve_svelte(conditions));
 		build.onLoad({ filter: /\.svelte\.[jt]s$/ }, load_module);
 		build.onLoad({ filter: /\.svelte$/ }, (args) => {

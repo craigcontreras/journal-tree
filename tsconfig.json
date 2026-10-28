@@ -18,5 +18,5 @@
 		}
 	},
 	"svelteOptions": { "namespace": "gpuixHTML" },
-	"include": ["*.ts", "*.svelte"]
+	"include": ["*.ts", "*.svelte", "lib/**/*.ts", "native/**/*.ts", "tests/**/*.svelte"]
 }

@@ -4,14 +4,17 @@
 	"version": "0.0.0",
 	"type": "module",
 	"scripts": {
-		"start": "gpuix-svelte app.ts",
-		"test": "gpuix-svelte test.ts",
+		"start": "node native/run.ts app.ts",
+		"test": "node native/run.ts test.ts && node native/run.ts test-editor.ts && node native/run.ts test-markdown.ts && node native/run.ts test-lists.ts && node native/run.ts test-typography.ts",
+		"native:build": "node native/build.ts",
+		"native:test": "node native/build.ts --test",
 		"build": "bun build.ts",
 		"typecheck": "tsc --noEmit && svelte-check --diagnostic-sources js,svelte --fail-on-warnings"
 	},
 	"dependencies": {
+		"@gpuix/native": "0.10.0",
 		"axios": "^1.20.0",
-		"gpuix-svelte": "^0.2.0"
+		"gpuix-svelte": "0.2.0"
 	},
 	"devDependencies": {
 		"@types/bun": "^1.4.3",
