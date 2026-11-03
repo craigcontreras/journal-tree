@@ -15,7 +15,7 @@ Journal Tree is a personal engineering project inspired by Obsidian. The goal is
 
 The main challenge is keeping an editable Markdown source and its formatted display in sync. Hiding delimiters changes text offsets, which affects cursor movement, selection, syntax highlighting, and Unicode handling. The Rust extension maps between source and display positions while retaining the underlying Markdown.
 
-The interface renders directly into a native GPUI window through [gpuix-svelte](https://khromov.github.io/gpuix-svelte/llms.txt). Svelte manages the UI and reactive state. Rust handles Markdown projection and editor behavior. This provides a way to explore native text editing beyond a browser-based editor.
+The interface renders directly into a native GPUI window through gpuix-svelte. Svelte manages the UI and reactive state. Rust handles Markdown projection and editor behavior. This provides a way to explore native text editing beyond a browser-based editor.
 
 The native build pins its GPUIX and Zed source revisions, applies the project's textarea patch, and builds the extension with a project-local Rust toolchain.
 
