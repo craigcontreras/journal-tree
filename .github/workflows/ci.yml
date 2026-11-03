@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  typecheck:
+    name: Type checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+
+  native-tests:
+    name: Native editor tests (macOS arm64)
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - name: Cache native toolchain and build files
+        uses: actions/cache@v6
+        with:
+          path: .native-build
+          key: native-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('native/config.ts') }}-${{ hashFiles('native/**', 'package-lock.json') }}
+          restore-keys: |
+            native-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('native/config.ts') }}-
+      - run: npm run native:build
+      - run: npm run native:test
+      - run: npm test

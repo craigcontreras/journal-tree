@@ -44,7 +44,7 @@ async function sourceArchive(repo: string, revision: string, target: string): Pr
 	const marker = join(target, '.journal-tree-revision');
 	if (await exists(marker) && (await readFile(marker, 'utf8')) === revision) return;
 	const archive = join(buildRoot, 'downloads', `${repo}-${revision}.tar.gz`);
-	console.log(`Preparing ${repo} at ${revision.slice(0, 8)}…`);
+	console.log(`Preparing ${repo} at ${revision.slice(0, 8)}...`);
 	if (!(await exists(archive))) await download(`https://github.com/remorses/${repo}/archive/${revision}.tar.gz`, archive);
 	await mkdir(target, { recursive: true });
 	await checked('tar', ['-xzf', archive, '-C', target, '--strip-components=1']);
@@ -57,7 +57,7 @@ const host = ({ 'darwin-arm64': 'aarch64-apple-darwin', 'linux-x64': 'x86_64-unk
 if (!host) throw new Error('Native Markdown builds support macOS arm64, Linux x64, and Windows x64.');
 
 if (!(await exists(cargo))) {
-	console.log('Installing a project-local Rust toolchain (shell settings are unchanged)…');
+	console.log('Installing a project-local Rust toolchain (shell settings are unchanged)...');
 	const installer = join(toolsRoot, `rustup-init${executableSuffix}`);
 	const installerUrl = `https://static.rust-lang.org/rustup/dist/${host}/rustup-init${executableSuffix}`;
 	await download(installerUrl, installer);
@@ -94,7 +94,7 @@ const manifest = join(sourceRoot, 'packages/native/Cargo.toml');
 if (process.argv.includes('--test')) {
 	await checked(cargo, ['test', '--locked', '--release', '--manifest-path', manifest, '--lib', 'custom_elements::markdown_']);
 } else {
-	console.log('Building the native Markdown editor…');
+	console.log('Building the native Markdown editor...');
 	await checked(cargo, ['build', '--locked', '--release', '--manifest-path', manifest]);
 	await mkdir(join(buildRoot, 'artifacts'), { recursive: true });
 	const library = process.platform === 'darwin' ? 'libgpuix_native.dylib' : process.platform === 'win32' ? 'gpuix_native.dll' : 'libgpuix_native.so';
