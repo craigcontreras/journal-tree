@@ -1,15 +1,41 @@
 --- a/packages/native/src/custom_elements/input.rs
 +++ b/packages/native/src/custom_elements/input.rs
-@@ -23,6 +23,8 @@
- use unicode_segmentation::UnicodeSegmentation;
+@@ -8,21 +8,27 @@
+ //! Upstream: https://github.com/zeronsh/comet/blob/main/crates/ui/src/composer.rs
+ //! Reviewed at: https://github.com/zeronsh/comet/blob/b3fa51872f70c8f973c241b659cf0c166766f4f5/crates/ui/src/composer.rs
+
++use std::borrow::Cow;
+ use std::collections::VecDeque;
+ use std::ops::Range;
++use std::sync::Arc;
+ use std::time::Duration;
+
+ use gpui::{
+-    actions, div, fill, point, prelude::*, px, relative, size, App, Bounds, ClipboardEntry,
+-    ClipboardItem, Context, CursorStyle, DispatchPhase, ElementInputHandler, Entity,
+-    EntityInputHandler, FocusHandle, GlobalElementId, KeyBinding, LayoutId, MouseButton,
+-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ScrollWheelEvent,
+-    SharedString, Style, Task, TextRun, TextStyle, UTF16Selection, UnderlineStyle, Window,
+-    WrappedLine,
++    actions, div, fill, point, prelude::*, px, relative, size, Along, App, Axis, Bounds,
++    ClipboardEntry, ClipboardItem, Context, CursorStyle, DispatchPhase, ElementInputHandler,
++    Entity, EntityInputHandler, FocusHandle, GlobalElementId, Hitbox, HitboxBehavior, KeyBinding,
++    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
++    ScrollWheelEvent, SharedString, Size, Style, Task, TextRun, TextStyle, UTF16Selection,
++    UnderlineStyle, Window, WrappedLine,
+ };
+-use unicode_segmentation::UnicodeSegmentation;
++use ropey::Rope;
++use unicode_segmentation::{GraphemeCursor, GraphemeIncomplete, UnicodeSegmentation};
  use web_time::Instant;
- 
+
++use super::file_buffer::FileBuffer;
 +use super::markdown_blocks::{indent_lines, list_newline};
 +use super::markdown_input::{shape_lines, smart_em_dash, MarkdownCache, Projection};
  use super::{CustomElement, CustomElementFactory, CustomRenderContext};
  use crate::renderer::{emit_event_full, EventCallback};
  use crate::theme::Theme;
-@@ -63,6 +65,9 @@
+@@ -63,6 +69,9 @@
          Undo,
          Redo,
          Newline,
@@ -19,15 +45,75 @@
          Submit,
      ]
  );
-@@ -70,6 +75,7 @@
+@@ -70,11 +79,67 @@
  const INPUT_KEY_CONTEXT: &str = "GpuixInput";
  const TEXTAREA_KEY_CONTEXT: &str = "GpuixTextarea";
  const TEXTAREA_SUBMIT_KEY_CONTEXT: &str = "GpuixTextareaSubmit";
 +const MARKDOWN_KEY_CONTEXT: &str = "GpuixMarkdownTextarea";
  const CARET_BLINK_MS: u64 = 500;
  const CARET_WIDTH: Pixels = px(2.0);
++const SCROLLBAR_GUTTER: Pixels = px(12.0);
++const SCROLLBAR_INSET: Pixels = px(3.0);
  const DRAG_SCROLL_FRAME_MS: u64 = 16;
-@@ -177,6 +183,18 @@
+ const UNDO_COALESCE: Duration = Duration::from_millis(700);
+ const UNDO_LIMIT: usize = 200;
++
++fn scrollbar_gutter(enabled: bool, width: Pixels) -> Pixels {
++    if enabled && width >= SCROLLBAR_GUTTER * 2.0 {
++        SCROLLBAR_GUTTER
++    } else {
++        px(0.0)
++    }
++}
++
++#[derive(Clone, Copy)]
++struct EditorScrollbar {
++    axis: Axis,
++    track: Bounds<Pixels>,
++    thumb: Bounds<Pixels>,
++    max_scroll: f32,
++}
++
++impl EditorScrollbar {
++    fn grab_offset(&self, position: Point<Pixels>) -> Pixels {
++        let length = self.thumb.size.along(self.axis);
++        let offset = position.along(self.axis) - self.thumb.origin.along(self.axis);
++        if offset >= px(0.0) && offset <= length {
++            offset
++        } else {
++            length / 2.0
++        }
++    }
++
++    fn scroll_offset(&self, position: Point<Pixels>, grab_offset: Pixels) -> f32 {
++        let travel = self.track.size.along(self.axis) - self.thumb.size.along(self.axis);
++        let progress =
++            (position.along(self.axis) - self.track.origin.along(self.axis) - grab_offset) / travel;
++        progress.clamp(0.0, 1.0) * self.max_scroll
++    }
++
++    fn painted_track(&self) -> Bounds<Pixels> {
++        let cross = self.axis.invert();
++        Bounds::new(
++            self.track
++                .origin
++                .apply_along(cross, |_| self.thumb.origin.along(cross)),
++            self.track
++                .size
++                .apply_along(cross, |_| self.thumb.size.along(cross)),
++        )
++    }
++}
++
++#[derive(Clone, Copy)]
++struct ScrollbarDrag {
++    bar: EditorScrollbar,
++    grab_offset: Pixels,
++}
+
+ fn caret_visible(ms_since_activity: u64) -> bool {
+     (ms_since_activity / CARET_BLINK_MS) % 2 == 0
+@@ -177,6 +242,18 @@
          word_navigation_uses_alt,
          bind_paste_shortcut,
      ));
@@ -45,8 +131,8 @@
 +    bindings.extend(markdown_bindings);
      cx.bind_keys(bindings);
  }
- 
-@@ -194,7 +212,11 @@
+
+@@ -194,7 +271,11 @@
          } else {
              KeyBinding::new("enter", Newline, context)
          },
@@ -59,37 +145,100 @@
          KeyBinding::new("backspace", Backspace, context),
          KeyBinding::new("delete", Delete, context),
          KeyBinding::new("left", Left, context),
-@@ -309,6 +331,7 @@
- 
+@@ -309,13 +390,18 @@
+
  struct TextEditorElement {
      multiline: bool,
+-    value: String,
 +    markdown: bool,
-     value: String,
++    large_file: bool,
++    scrollbar: bool,
++    start_at_top: bool,
++    file_buffer_id: Option<u32>,
++    value: Option<String>,
      placeholder: String,
      read_only: bool,
-@@ -323,6 +346,7 @@
+     min_rows: usize,
+     max_rows: usize,
+-    last_prop_value: Option<String>,
+     theme: Theme,
++    theme_changed: bool,
+     state: Option<Entity<TextEditorState>>,
+ }
+
+@@ -323,13 +409,18 @@
      fn new(multiline: bool) -> Self {
          Self {
              multiline,
+-            value: String::new(),
 +            markdown: false,
-             value: String::new(),
++            large_file: false,
++            scrollbar: false,
++            start_at_top: false,
++            file_buffer_id: None,
++            value: None,
              placeholder: String::new(),
              read_only: false,
-@@ -358,6 +382,9 @@
-                 let value = self.value.clone();
+             min_rows: 1,
+             max_rows: if multiline { 10 } else { 1 },
+-            last_prop_value: None,
+             theme: Theme::dark(),
++            theme_changed: false,
+             state: None,
+         }
+     }
+@@ -352,19 +443,32 @@
+         let emits_key_up = ctx.events.contains("keyUp");
+         let callback = ctx.event_callback.clone();
+
++        let file_buffer_id = self.file_buffer_id.filter(|_| self.multiline);
++        let large_file = self.multiline && (self.large_file || file_buffer_id.is_some());
++        let markdown = self.multiline && self.markdown && !large_file;
++        let scrollbar = self.multiline && self.scrollbar;
++        let start_at_top = self.start_at_top || large_file;
+         let state = self
+             .state
+             .get_or_insert_with(|| {
+-                let value = self.value.clone();
++                let value = self.value.take().unwrap_or_default();
                  let placeholder = self.placeholder.clone();
                  let multiline = self.multiline;
-+                let markdown = self.multiline && self.markdown;
 +                let code_font = SharedString::from(self.theme.font_mono.clone());
 +                let markdown_theme = self.theme.clone();
                  let read_only = self.read_only;
                  let min_rows = self.min_rows;
                  let max_rows = self.max_rows;
-@@ -377,6 +404,12 @@
-                     content: value,
+                 let caret_color = self.theme.caret;
+                 let callback = callback.clone();
+                 let id = ctx.id;
+-                let cursor = value.len();
++                let cursor = if start_at_top { 0 } else { value.len() };
++                let file_buffer = file_buffer_id.and_then(FileBuffer::get);
++                let content = if let Some(file) = &file_buffer {
++                    TextBuffer::Large(file.rope.lock().clone())
++                } else {
++                    TextBuffer::new(value, large_file)
++                };
+                 let state_focus_handle = focus_handle.clone();
+                 cx.new(move |cx| TextEditorState {
+                     element_id: id,
+@@ -374,9 +478,23 @@
+                     emits_key_down,
+                     emits_key_up,
+                     focus_handle: state_focus_handle,
+-                    content: value,
++                    content,
++                    file_buffer,
                      placeholder: placeholder.into(),
                      multiline,
 +                    markdown,
++                    large_file,
++                    scrollbar,
++                    start_at_top,
++                    scrollbar_gutters: size(px(0.0), px(0.0)),
++                    scrollbar_drag: None,
++                    scrollbar_frame_pending: false,
++                    line_origin_y: px(0.0),
 +                    markdown_cache: MarkdownCache::default(),
 +                    display_map: None,
 +                    markdown_theme,
@@ -98,45 +247,335 @@
                      read_only,
                      min_rows,
                      max_rows,
-@@ -391,6 +424,7 @@
+@@ -391,7 +509,14 @@
                      scroll_left: 0.0,
                      follow_cursor: true,
                      last_lines: Vec::new(),
+-                    line_starts: vec![0],
 +                    last_line_heights: Vec::new(),
-                     line_starts: vec![0],
++                    line_starts: Vec::new(),
++                    line_tops: vec![px(0.0)],
++                    layout_key: None,
++                    layout_width: None,
++                    layout_rows: None,
++                    measured_heights: VecDeque::new(),
++                    display_text: SharedString::default(),
                      last_bounds: None,
                      line_height: px(20.0),
-@@ -421,6 +455,9 @@
+                     font_size: px(16.0),
+@@ -409,7 +534,7 @@
+             })
+             .clone();
+
+-        let prop_changed = self.last_prop_value.as_ref() != Some(&self.value);
++        let theme_changed = std::mem::take(&mut self.theme_changed);
+         state.update(cx, |state, cx| {
+             state.callback = callback;
+             state.emits_change = emits_change;
+@@ -419,19 +544,57 @@
+             }
+             state.emits_key_down = emits_key_down;
              state.emits_key_up = emits_key_up;
-             state.placeholder = self.placeholder.clone().into();
+-            state.placeholder = self.placeholder.clone().into();
++            if state.placeholder.as_ref() != self.placeholder {
++                state.placeholder = self.placeholder.clone().into();
++                state.layout_key = None;
++                cx.notify();
++            }
              state.read_only = self.read_only;
-+            state.markdown = self.multiline && self.markdown;
-+            state.code_font = self.theme.font_mono.clone().into();
-+            state.markdown_theme = self.theme.clone();
++            if state.markdown != markdown {
++                state.markdown = markdown;
++                state.layout_key = None;
++                cx.notify();
++            }
++            state.scrollbar = scrollbar;
++            state.start_at_top = start_at_top;
++            let file_changed = state.file_buffer.as_ref().map(|file| file.id) != file_buffer_id;
++            if state.large_file != large_file || file_changed {
++                state.large_file = large_file;
++                let old_file = state.file_buffer.take();
++                state.file_buffer = file_buffer_id.and_then(FileBuffer::get);
++                if let Some(file) = &state.file_buffer {
++                    let content = TextBuffer::Large(file.rope.lock().clone());
++                    state.reset_content(content, cx);
++                } else {
++                    let value = self.value.take().unwrap_or_else(|| {
++                        if old_file.is_some() {
++                            String::new()
++                        } else {
++                            state.content.text().into_owned()
++                        }
++                    });
++                    state.reset_content(TextBuffer::new(value, large_file), cx);
++                }
++            }
++            if theme_changed {
++                state.code_font = self.theme.font_mono.clone().into();
++                state.markdown_theme = self.theme.clone();
++                state.layout_key = None;
++                cx.notify();
++            }
              state.min_rows = self.min_rows.max(1);
              state.max_rows = self.max_rows.max(state.min_rows);
              if state.caret_color != self.theme.caret {
-@@ -514,6 +551,7 @@
-             "value" => self.value = value.as_str().unwrap_or_default().to_string(),
+                 state.caret_color = self.theme.caret;
+                 cx.notify();
+             }
+-            if prop_changed {
+-                state.sync_prop_value(self.value.clone(), cx);
++            let value = self.value.take();
++            if state.file_buffer.is_none() {
++                if let Some(value) = value {
++                    state.sync_prop_value(value, cx);
++                }
+             }
+         });
+-        self.last_prop_value = Some(self.value.clone());
+
+         let element_id = gpui::SharedString::from(format!("__gpuix_editor_{}", ctx.id));
+         let mut editor = div()
+@@ -440,7 +603,7 @@
+             .min_w_0()
+             .w_full()
+             .track_focus(&focus_handle)
+-            .child(state);
++            .child(state.clone());
+         // Single-line inputs center text vertically when given extra height.
+         if !self.multiline {
+             editor = editor.items_center();
+@@ -465,8 +628,12 @@
+             gpui::Role::TextInput
+         };
+         editor = crate::accessibility::apply_accessibility(editor, ctx.props, Some(default_role));
+-        if ctx.props.get("aria-valuetext").is_none() && !self.value.is_empty() {
+-            editor = editor.aria_value(self.value.clone());
++        if ctx.props.get("aria-valuetext").is_none() {
++            if let TextBuffer::Plain(value) = &state.read(cx).content {
++                if !value.is_empty() {
++                    editor = editor.aria_value(value.clone());
++                }
++            }
+         }
+         if !self.placeholder.is_empty() {
+             editor = editor.aria_placeholder(self.placeholder.clone());
+@@ -511,9 +678,16 @@
+
+     fn set_prop(&mut self, key: &str, value: serde_json::Value) {
+         match key {
+-            "value" => self.value = value.as_str().unwrap_or_default().to_string(),
++            "value" => self.value = Some(value.as_str().unwrap_or_default().to_string()),
              "placeholder" => self.placeholder = value.as_str().unwrap_or_default().to_string(),
              "readOnly" => self.read_only = value.as_bool().unwrap_or(false),
 +            "markdown" => self.markdown = value.as_bool().unwrap_or(false),
++            "largeFile" => self.large_file = value.as_bool().unwrap_or(false),
++            "scrollbar" => self.scrollbar = value.as_bool().unwrap_or(false),
++            "startAtTop" => self.start_at_top = value.as_bool().unwrap_or(false),
++            "fileBufferId" => {
++                self.file_buffer_id = value.as_u64().and_then(|id| u32::try_from(id).ok())
++            }
              "minRows" => self.min_rows = value.as_u64().unwrap_or(1) as usize,
              "maxRows" => {
                  self.max_rows = value
-@@ -531,6 +569,7 @@
+@@ -521,7 +695,10 @@
+                     .unwrap_or(if self.multiline { 10 } else { 1 })
+                     as usize
+             }
+-            "theme" => self.theme = Theme::from_prop(Some(&value)),
++            "theme" => {
++                self.theme = Theme::from_prop(Some(&value));
++                self.theme_changed = true;
++            }
+             _ => {}
+         }
+     }
+@@ -531,6 +708,11 @@
              "value",
              "placeholder",
              "readOnly",
 +            "markdown",
++            "largeFile",
++            "scrollbar",
++            "startAtTop",
++            "fileBufferId",
              "minRows",
              "maxRows",
              "theme",
-@@ -639,6 +678,12 @@
-     content: String,
+@@ -549,8 +731,144 @@
+ }
+
+ #[derive(Clone)]
++enum TextBuffer {
++    Plain(String),
++    Large(Rope),
++}
++
++impl TextBuffer {
++    fn new(value: String, large_file: bool) -> Self {
++        if large_file {
++            Self::Large(Rope::from_str(&value))
++        } else {
++            Self::Plain(value)
++        }
++    }
++
++    fn len(&self) -> usize {
++        match self {
++            Self::Plain(text) => text.len(),
++            Self::Large(rope) => rope.len_bytes(),
++        }
++    }
++
++    fn is_empty(&self) -> bool {
++        self.len() == 0
++    }
++
++    fn equals(&self, value: &str) -> bool {
++        match self {
++            Self::Plain(text) => text == value,
++            Self::Large(rope) => rope == value,
++        }
++    }
++
++    fn text(&self) -> Cow<'_, str> {
++        self.slice(0..self.len())
++    }
++
++    fn slice(&self, range: Range<usize>) -> Cow<'_, str> {
++        match self {
++            Self::Plain(text) => Cow::Borrowed(&text[range]),
++            Self::Large(rope) => {
++                let slice = rope.byte_slice(range);
++                match slice.as_str() {
++                    Some(text) => Cow::Borrowed(text),
++                    None => Cow::Owned(slice.to_string()),
++                }
++            }
++        }
++    }
++
++    fn replace(&mut self, range: Range<usize>, replacement: &str) {
++        match self {
++            Self::Plain(text) => text.replace_range(range, replacement),
++            Self::Large(rope) => {
++                let start = rope.byte_to_char(range.start);
++                let end = rope.byte_to_char(range.end);
++                rope.remove(start..end);
++                rope.insert(start, replacement);
++            }
++        }
++    }
++
++    fn line_range_at(&self, offset: usize) -> Range<usize> {
++        match self {
++            Self::Plain(text) => {
++                let start = text[..offset].rfind('\n').map_or(0, |i| i + 1);
++                let end = text[offset..].find('\n').map_or(text.len(), |i| offset + i);
++                start..end
++            }
++            Self::Large(rope) => {
++                let row = rope.byte_to_line(offset);
++                let start = rope.line_to_byte(row);
++                let end = if row + 1 < rope.len_lines() {
++                    rope.line_to_byte(row + 1) - 1
++                } else {
++                    rope.len_bytes()
++                };
++                start..end
++            }
++        }
++    }
++
++    fn visible_offset(&self, offset: usize) -> usize {
++        // A CRLF pair is one line break. GPUI splits on LF, so hit testing
++        // at the end of the painted row can otherwise land inside the pair.
++        if let Self::Large(rope) = self {
++            if offset > 0
++                && offset < rope.len_bytes()
++                && rope.byte(offset - 1) == b'\r'
++                && rope.byte(offset) == b'\n'
++            {
++                return offset - 1;
++            }
++        }
++        offset
++    }
++
++    fn grapheme_boundary(&self, offset: usize, forward: bool) -> usize {
++        let end = self.len();
++        let fallback = if forward { end } else { 0 };
++        if offset == fallback {
++            return fallback;
++        }
++        let mut cursor = GraphemeCursor::new(offset, end, true);
++        let boundary = |cursor: &mut GraphemeCursor, chunk, start| {
++            if forward {
++                cursor.next_boundary(chunk, start)
++            } else {
++                cursor.prev_boundary(chunk, start)
++            }
++        };
++        match self {
++            Self::Plain(text) => boundary(&mut cursor, text, 0)
++                .ok()
++                .flatten()
++                .unwrap_or(fallback),
++            Self::Large(rope) => {
++                let mut byte = if forward { offset } else { offset - 1 };
++                loop {
++                    let (chunk, start, _, _) = rope.chunk_at_byte(byte);
++                    match boundary(&mut cursor, chunk, start) {
++                        Ok(offset) => return offset.unwrap_or(fallback),
++                        Err(GraphemeIncomplete::PrevChunk) => byte = start - 1,
++                        Err(GraphemeIncomplete::NextChunk) => byte = start + chunk.len(),
++                        Err(GraphemeIncomplete::PreContext(end)) => {
++                            let (context, start, _, _) = rope.chunk_at_byte(end - 1);
++                            cursor.provide_context(&context[..end - start], start);
++                        }
++                        Err(GraphemeIncomplete::InvalidOffset) => return fallback,
++                    }
++                }
++            }
++        }
++    }
++}
++
++#[derive(Clone)]
+ struct EditSnapshot {
+-    content: String,
++    content: TextBuffer,
+     selected_range: Range<usize>,
+     selection_reversed: bool,
+ }
+@@ -628,6 +946,13 @@
+     history.push_back(snapshot);
+ }
+
++struct EditorLayoutKey {
++    style: TextStyle,
++    rem_size: Pixels,
++    selection: Option<Range<usize>>,
++    marked: Option<Range<usize>>,
++}
++
+ struct TextEditorState {
+     element_id: u64,
+     callback: Option<EventCallback>,
+@@ -636,9 +961,22 @@
+     emits_key_down: bool,
+     emits_key_up: bool,
+     focus_handle: FocusHandle,
+-    content: String,
++    content: TextBuffer,
++    file_buffer: Option<Arc<FileBuffer>>,
      placeholder: SharedString,
      multiline: bool,
 +    markdown: bool,
++    large_file: bool,
++    scrollbar: bool,
++    start_at_top: bool,
++    scrollbar_gutters: Size<Pixels>,
++    scrollbar_drag: Option<ScrollbarDrag>,
++    scrollbar_frame_pending: bool,
 +    markdown_cache: MarkdownCache,
 +    display_map: Option<Projection>,
 +    markdown_theme: Theme,
@@ -145,20 +584,268 @@
      read_only: bool,
      min_rows: usize,
      max_rows: usize,
-@@ -653,6 +698,7 @@
+@@ -653,7 +991,17 @@
      scroll_left: f32,
      follow_cursor: bool,
      last_lines: Vec<WrappedLine>,
 +    last_line_heights: Vec<Pixels>,
      line_starts: Vec<usize>,
++    // Cumulative height, including one trailing entry for the last line's end.
++    // Coordinates are relative to line_origin_y for the large-file viewport.
++    line_tops: Vec<Pixels>,
++    layout_key: Option<EditorLayoutKey>,
++    layout_width: Option<Pixels>,
++    layout_rows: Option<Range<usize>>,
++    measured_heights: VecDeque<(Pixels, f32)>,
++    display_text: SharedString,
++    line_origin_y: Pixels,
      last_bounds: Option<Bounds<Pixels>>,
      line_height: Pixels,
-@@ -1124,8 +1170,44 @@
- 
+     font_size: Pixels,
+@@ -711,20 +1059,26 @@
+             return;
+         }
+         self.pending_values.clear();
+-        self.set_external_text(value, cx);
+-    }
+-
+-    fn set_external_text(&mut self, value: String, cx: &mut Context<Self>) {
+-        if self.content == value {
+-            return;
+-        }
+-        self.content = value;
+-        let end = self.content.len();
+-        self.selected_range = end..end;
++        if !self.content.equals(&value) {
++            self.reset_content(TextBuffer::new(value, self.large_file), cx);
++        }
++    }
++
++    fn reset_content(&mut self, content: TextBuffer, cx: &mut Context<Self>) {
++        self.pending_values.clear();
++        self.content = content;
++        self.layout_key = None;
++        let cursor = if self.start_at_top {
++            0
++        } else {
++            self.content.len()
++        };
++        self.selected_range = cursor..cursor;
+         self.selection_reversed = false;
+         self.marked_range = None;
+         self.scroll_top = 0.0;
+         self.scroll_left = 0.0;
++        self.scrollbar_drag = None;
+         self.follow_cursor = true;
+         self.reset_blink(cx);
+         self.undo_stack.clear();
+@@ -733,14 +1087,35 @@
+         cx.notify();
+     }
+
++    fn update_file_buffer(&self) {
++        if let (Some(file), TextBuffer::Large(rope)) = (&self.file_buffer, &self.content) {
++            *file.rope.lock() = rope.clone();
++        }
++    }
++
+     fn emit_change(&mut self) {
++        self.update_file_buffer();
+         if self.emits_change {
+-            self.pending_values.push_back(self.content.clone());
+-            while self.pending_values.len() > 32 {
+-                self.pending_values.pop_front();
++            let value = self.content.text().into_owned();
++            if !self.large_file {
++                self.pending_values.push_back(value.clone());
++                while self.pending_values.len() > 32 {
++                    self.pending_values.pop_front();
++                }
+             }
+             emit_event_full(&self.callback, self.element_id, "change", |payload| {
+-                payload.value = Some(self.content.clone());
++                payload.value = Some(value);
++            });
++        }
++    }
++
++    fn emit_edit(&mut self, range: Range<usize>, replacement: String) {
++        self.update_file_buffer();
++        if self.emits_change {
++            emit_event_full(&self.callback, self.element_id, "change", |payload| {
++                payload.start_index = Some(range.start as f64);
++                payload.end_index = Some(range.end as f64);
++                payload.value = Some(replacement);
+             });
+         }
+     }
+@@ -748,13 +1123,14 @@
+     fn emit_submit(&self) {
+         if self.emits_submit {
+             emit_event_full(&self.callback, self.element_id, "submit", |payload| {
+-                payload.value = Some(self.content.clone());
++                payload.value = Some(self.content.text().into_owned());
+             });
+         }
+     }
+
+     fn restore(&mut self, snapshot: EditSnapshot, cx: &mut Context<Self>) {
+         self.content = snapshot.content;
++        self.layout_key = None;
+         self.selected_range = snapshot.selected_range;
+         self.selection_reversed = snapshot.selection_reversed;
+         self.marked_range = None;
+@@ -817,53 +1193,83 @@
+     }
+
+     fn previous_boundary(&self, offset: usize) -> usize {
+-        self.content
+-            .grapheme_indices(true)
+-            .rev()
+-            .find_map(|(index, _)| (index < offset).then_some(index))
+-            .unwrap_or(0)
++        self.content.grapheme_boundary(offset, false)
+     }
+
+     fn next_boundary(&self, offset: usize) -> usize {
+-        self.content
+-            .grapheme_indices(true)
+-            .find_map(|(index, _)| (index > offset).then_some(index))
+-            .unwrap_or(self.content.len())
++        self.content.grapheme_boundary(offset, true)
+     }
+
+     fn previous_word_boundary(&self, offset: usize) -> usize {
+-        self.content
+-            .split_word_bound_indices()
+-            .rev()
+-            .find_map(|(index, word)| (index < offset && !word.trim().is_empty()).then_some(index))
+-            .unwrap_or(0)
++        if let TextBuffer::Plain(text) = &self.content {
++            return text
++                .split_word_bound_indices()
++                .rev()
++                .find_map(|(i, word)| (i < offset && !word.trim().is_empty()).then_some(i))
++                .unwrap_or(0);
++        }
++        let mut end = self.content.line_range_at(offset).end;
++        loop {
++            let start = self.content.line_range_at(end).start;
++            if let Some((index, _)) = self
++                .content
++                .slice(start..end)
++                .split_word_bound_indices()
++                .rev()
++                .find(|(index, word)| start + index < offset && !word.trim().is_empty())
++            {
++                return start + index;
++            }
++            if start == 0 {
++                return 0;
++            }
++            end = start - 1;
++        }
+     }
+
+     fn next_word_boundary(&self, offset: usize) -> usize {
+-        self.content
+-            .split_word_bound_indices()
+-            .find_map(|(index, word)| {
+-                let end = index + word.len();
+-                (end > offset && !word.trim().is_empty()).then_some(end)
+-            })
+-            .unwrap_or(self.content.len())
+-    }
+-
+-    fn line_range_at(&self, offset: usize) -> Range<usize> {
+-        let start = self.content[..offset]
+-            .rfind('\n')
+-            .map(|index| index + 1)
+-            .unwrap_or(0);
+-        let end = self.content[offset..]
+-            .find('\n')
+-            .map(|index| offset + index)
+-            .unwrap_or(self.content.len());
+-        start..end
++        let len = self.content.len();
++        if let TextBuffer::Plain(text) = &self.content {
++            return text
++                .split_word_bound_indices()
++                .find_map(|(index, word)| {
++                    let end = index + word.len();
++                    (end > offset && !word.trim().is_empty()).then_some(end)
++                })
++                .unwrap_or(len);
++        }
++        let mut start = self.content.line_range_at(offset).start;
++        loop {
++            let end = self.content.line_range_at(start).end;
++            if let Some(end) = self
++                .content
++                .slice(start..end)
++                .split_word_bound_indices()
++                .find_map(|(index, word)| {
++                    let end = start + index + word.len();
++                    (end > offset && !word.trim().is_empty()).then_some(end)
++                })
++            {
++                return end;
++            }
++            if end == len {
++                return len;
++            }
++            start = end + 1;
++        }
+     }
+
+     fn visual_line_boundary(&self, end: bool) -> usize {
++        if self.large_file {
++            let line = self.content.line_range_at(self.cursor_offset());
++            return if end {
++                self.content.visible_offset(line.end)
++            } else {
++                line.start
++            };
++        }
+         let Some(cursor) = self.point_for_index(self.cursor_offset()) else {
+-            let line = self.line_range_at(self.cursor_offset());
++            let line = self.content.line_range_at(self.cursor_offset());
+             return if end { line.end } else { line.start };
+         };
+         self.index_for_point(point(
+@@ -1045,7 +1451,7 @@
+             return;
+         }
+         if self.selected_range.is_empty() {
+-            let start = self.line_range_at(self.cursor_offset()).start;
++            let start = self.content.line_range_at(self.cursor_offset()).start;
+             if start == self.cursor_offset() {
+                 return;
+             }
+@@ -1064,7 +1470,7 @@
+             return;
+         }
+         if self.selected_range.is_empty() {
+-            let end = self.line_range_at(self.cursor_offset()).end;
++            let end = self.content.line_range_at(self.cursor_offset()).end;
+             if end == self.cursor_offset() {
+                 return;
+             }
+@@ -1076,7 +1482,7 @@
+     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+         if !self.selected_range.is_empty() {
+             cx.write_to_clipboard(ClipboardItem::new_string(
+-                self.content[self.selected_range.clone()].to_string(),
++                self.content.slice(self.selected_range.clone()).into_owned(),
+             ));
+         }
+     }
+@@ -1124,8 +1530,44 @@
+
      fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
          if self.multiline && !self.read_only {
 +            if self.markdown && self.marked_range.is_none() {
-+                if let Some(edit) = list_newline(&self.content, &self.selected_range) {
++                if let Some(edit) = list_newline(&self.content.text(), &self.selected_range) {
 +                    let range = self.range_to_utf16(&edit.range);
 +                    self.replace_text_in_range(Some(range), &edit.text, window, cx);
 +                    self.last_edit = None;
@@ -179,7 +866,7 @@
 +        if !self.markdown || self.read_only || self.marked_range.is_some() {
 +            return;
 +        }
-+        if let Some(change) = indent_lines(&self.content, &self.selected_range, outdent) {
++        if let Some(change) = indent_lines(&self.content.text(), &self.selected_range, outdent) {
 +            let reversed = self.selection_reversed;
 +            let range = self.range_to_utf16(&change.edit.range);
 +            self.replace_text_in_range(Some(range), &change.edit.text, window, cx);
@@ -196,13 +883,46 @@
 +    fn outdent(&mut self, _: &Outdent, window: &mut Window, cx: &mut Context<Self>) {
 +        self.change_indent(true, window, cx);
      }
- 
+
      fn submit(&mut self, _: &Submit, _: &mut Window, _: &mut Context<Self>) {
-@@ -1134,7 +1216,12 @@
- 
+@@ -1133,8 +1575,44 @@
+     }
+
      fn vertical_target(&self, direction: f32) -> Option<usize> {
-         let current = self.point_for_index(self.cursor_offset())?;
+-        let current = self.point_for_index(self.cursor_offset())?;
 -        let target_y = f32::from(current.y) + direction * f32::from(self.line_height);
++        let offset = self.cursor_offset();
++        if let TextBuffer::Large(rope) = &self.content {
++            let row = rope.byte_to_line(offset);
++            let target_row = if direction < 0.0 {
++                let Some(previous) = row.checked_sub(1) else {
++                    return Some(0);
++                };
++                previous
++            } else {
++                if row + 1 == rope.len_lines() {
++                    return Some(rope.len_bytes());
++                }
++                row + 1
++            };
++            let target_start = rope.line_to_byte(target_row);
++            if !self.line_starts.contains(&target_start) || self.point_for_index(offset).is_none() {
++                let target_end = self.content.line_range_at(target_start).end;
++                let column = offset - rope.line_to_byte(row);
++                let target = (target_start + column).min(target_end);
++                if target == target_end {
++                    return Some(self.content.visible_offset(target_end));
++                }
++                let byte = rope.char_to_byte(rope.byte_to_char(target));
++                let after = self.content.grapheme_boundary(byte, true);
++                return Some(
++                    self.content
++                        .grapheme_boundary(after, false)
++                        .max(target_start),
++                );
++            }
++        }
++        let current = self.point_for_index(offset)?;
 +        let target_y = f32::from(current.y)
 +            + if direction < 0.0 {
 +                -0.5
@@ -212,33 +932,71 @@
          if target_y < 0.0 {
              return Some(0);
          }
-@@ -1145,21 +1232,56 @@
+@@ -1144,42 +1622,106 @@
+         Some(self.index_for_point(point(current.x, px(target_y))))
      }
- 
+
++    fn line_for_index(&self, display: usize) -> Option<usize> {
++        self.line_starts
++            .partition_point(|&start| start <= display)
++            .checked_sub(1)
++    }
++
      fn point_for_index(&self, index: usize) -> Option<Point<Pixels>> {
-+        let index = self
+-        for (line_index, line) in self.last_lines.iter().enumerate() {
+-            let line_start = *self.line_starts.get(line_index)?;
+-            if index < line_start || index > line_start + line.len() {
+-                continue;
+-            }
+-            let local = line.position_for_index(index - line_start, self.line_height)?;
+-            let y_offset: Pixels = self
+-                .last_lines
+-                .iter()
+-                .take(line_index)
+-                .map(|line| line.size(self.line_height).height)
+-                .sum();
+-            return Some(point(local.x, local.y + y_offset));
+-        }
+-        None
++        let display = self
 +            .display_map
 +            .as_ref()
 +            .map_or(index, |map| map.to_display(index));
-         for (line_index, line) in self.last_lines.iter().enumerate() {
-             let line_start = *self.line_starts.get(line_index)?;
-             if index < line_start || index > line_start + line.len() {
-                 continue;
-             }
--            let local = line.position_for_index(index - line_start, self.line_height)?;
-+            let local =
-+                line.position_for_index(index - line_start, self.line_height_at(line_index))?;
-             let y_offset: Pixels = self
-                 .last_lines
-                 .iter()
-                 .take(line_index)
--                .map(|line| line.size(self.line_height).height)
-+                .enumerate()
-+                .map(|(index, line)| line.size(self.line_height_at(index)).height)
-                 .sum();
-             return Some(point(local.x, local.y + y_offset));
-         }
-         None
++        let index = self.line_for_index(display)?;
++        let line = self.last_lines.get(index)?;
++        let local_offset = display - self.line_starts[index];
++        if local_offset > line.len() {
++            return None;
++        }
++        let local = line.position_for_index(local_offset, self.line_height_at(index))?;
++        Some(point(
++            local.x,
++            local.y + self.line_tops[index] + self.line_origin_y,
++        ))
++    }
++
++    fn rebuild_line_tops(&mut self) {
++        self.line_tops.clear();
++        self.line_tops.reserve(self.last_lines.len() + 1);
++        let mut top = px(0.0);
++        for (index, line) in self.last_lines.iter().enumerate() {
++            self.line_tops.push(top);
++            let height = self
++                .last_line_heights
++                .get(index)
++                .copied()
++                .unwrap_or(self.line_height);
++            top += line.size(height).height;
++        }
++        self.line_tops.push(top);
++    }
++
++    fn visible_lines(&self, viewport_height: Pixels) -> Range<usize> {
++        let top = px(self.scroll_top) - self.line_origin_y;
++        let bottom = top + viewport_height;
++        let first = self.line_tops[1..].partition_point(|&end| end <= top);
++        let end = self.line_tops[..self.last_lines.len()].partition_point(|&start| start < bottom);
++        first..end.max(first)
 +    }
 +
 +    fn line_height_at(&self, index: usize) -> Pixels {
@@ -262,43 +1020,148 @@
 +            .display_map
 +            .as_ref()
 +            .map_or(index, |map| map.to_display(index));
-+        self.line_starts
-+            .iter()
-+            .enumerate()
-+            .rev()
-+            .find(|(_, start)| **start <= display)
-+            .map_or(self.line_height, |(index, _)| self.line_height_at(index))
++        self.line_for_index(display)
++            .map_or(self.line_height, |index| self.line_height_at(index))
      }
- 
+
      fn index_for_point(&self, position: Point<Pixels>) -> usize {
-@@ -1168,14 +1290,20 @@
+         if self.display_is_placeholder {
+             return 0;
          }
-         let mut y = f32::from(position.y).max(0.0);
-         for (line_index, line) in self.last_lines.iter().enumerate() {
+-        let mut y = f32::from(position.y).max(0.0);
+-        for (line_index, line) in self.last_lines.iter().enumerate() {
 -            let height = f32::from(line.size(self.line_height).height);
-+            let height = f32::from(line.size(self.line_height_at(line_index)).height);
-             let line_start = self.line_starts.get(line_index).copied().unwrap_or(0);
-             if y < height || line_index + 1 == self.last_lines.len() {
-                 let local = point(position.x, px(y.min(height - 1.0).max(0.0)));
-                 let index = line
+-            let line_start = self.line_starts.get(line_index).copied().unwrap_or(0);
+-            if y < height || line_index + 1 == self.last_lines.len() {
+-                let local = point(position.x, px(y.min(height - 1.0).max(0.0)));
+-                let index = line
 -                    .closest_index_for_position(local, self.line_height)
-+                    .closest_index_for_position(local, self.line_height_at(line_index))
-                     .unwrap_or_else(|index| index);
+-                    .unwrap_or_else(|index| index);
 -                return (line_start + index).min(self.content.len());
-+                let display_index = line_start + index;
-+                return self
-+                    .display_map
-+                    .as_ref()
-+                    .map_or(display_index.min(self.content.len()), |map| {
-+                        map.to_source(display_index)
-+                    });
-             }
-             y -= height;
-         }
-@@ -1198,6 +1326,19 @@
+-            }
+-            y -= height;
+-        }
+-        self.content.len()
++        let Some(last) = self.last_lines.len().checked_sub(1) else {
++            return self.content.len();
++        };
++        let y = (position.y - self.line_origin_y).max(px(0.0));
++        let row = self.line_tops[1..]
++            .partition_point(|&end| end <= y)
++            .min(last);
++        let height = self.line_tops[row + 1] - self.line_tops[row];
++        let local = point(
++            position.x,
++            (y - self.line_tops[row]).min((height - px(1.0)).max(px(0.0))),
++        );
++        let offset = self.last_lines[row]
++            .closest_index_for_position(local, self.line_height_at(row))
++            .unwrap_or_else(|index| index);
++        let display_index = self.line_starts[row] + offset;
++        self.display_map.as_ref().map_or_else(
++            || {
++                self.content
++                    .visible_offset(display_index.min(self.content.len()))
++            },
++            |map| map.to_source(display_index),
++        )
+     }
+
+     fn index_for_mouse_position(&self, position: Point<Pixels>) -> usize {
+@@ -1190,6 +1732,72 @@
+             position.x - bounds.left() + px(self.scroll_left),
+             position.y - bounds.top() + px(self.scroll_top),
+         ))
++    }
++
++    fn max_scroll_left(&self, viewport_width: f32) -> f32 {
++        if self.multiline && !self.markdown && !self.large_file {
++            return 0.0;
++        }
++        (self.content_width + f32::from(CARET_WIDTH) - viewport_width).max(0.0)
++    }
++
++    fn scrollbar_geometry(&self, axis: Axis) -> Option<EditorScrollbar> {
++        let bounds = self.last_bounds?;
++        let cross = axis.invert();
++        let gutter = self.scrollbar_gutters.along(cross);
++        let length = f32::from(bounds.size.along(axis));
++        let (offset, max_scroll) = match axis {
++            Axis::Vertical => (self.scroll_top, self.content_height - length),
++            Axis::Horizontal => (self.scroll_left, self.max_scroll_left(length)),
++        };
++        if gutter <= px(0.0) || max_scroll <= 0.0 || length <= 1.0 {
++            return None;
++        }
++        let track = Bounds::new(
++            bounds
++                .origin
++                .apply_along(cross, |start| start + bounds.size.along(cross)),
++            bounds.size.apply_along(cross, |_| gutter),
++        );
++        let thumb_length = (length * length / (length + max_scroll))
++            .max(24.0)
++            .min(length - 1.0);
++        let thumb_start = px((length - thumb_length) * offset / max_scroll);
++        let thumb = Bounds::new(
++            track
++                .origin
++                .apply_along(axis, |start| start + thumb_start)
++                .apply_along(cross, |start| start + SCROLLBAR_INSET),
++            track
++                .size
++                .apply_along(axis, |_| px(thumb_length))
++                .apply_along(cross, |length| length - 2.0 * SCROLLBAR_INSET),
++        );
++        Some(EditorScrollbar {
++            axis,
++            track,
++            thumb,
++            max_scroll,
++        })
++    }
++
++    fn dragging_vertical_scrollbar(&self) -> bool {
++        self.scrollbar_drag
++            .is_some_and(|drag| drag.bar.axis == Axis::Vertical)
++    }
++
++    fn scroll_to_drag_position(&mut self, position: Point<Pixels>, drag: ScrollbarDrag) -> bool {
++        let offset = drag.bar.scroll_offset(position, drag.grab_offset);
++        let current = match drag.bar.axis {
++            Axis::Horizontal => &mut self.scroll_left,
++            Axis::Vertical => &mut self.scroll_top,
++        };
++        self.follow_cursor = false;
++        if *current == offset {
++            return false;
++        }
++        *current = offset;
++        true
+     }
+
+     fn on_mouse_down(
+@@ -1198,6 +1806,36 @@
          window: &mut Window,
          cx: &mut Context<Self>,
      ) {
++        self.scrollbar_drag = None;
++        let hit = [Axis::Vertical, Axis::Horizontal]
++            .into_iter()
++            .filter_map(|axis| self.scrollbar_geometry(axis))
++            .find(|bar| bar.track.contains(&event.position));
++        if let Some(bar) = hit {
++            let drag = ScrollbarDrag {
++                bar,
++                grab_offset: bar.grab_offset(event.position),
++            };
++            self.is_selecting = false;
++            self.scrollbar_drag = Some(drag);
++            self.scroll_to_drag_position(event.position, drag);
++            cx.notify();
++            cx.stop_propagation();
++            return;
++        }
 +        if self.markdown && (event.modifiers.platform || event.modifiers.control) {
 +            if let Some(url) = self
 +                .markdown_cache
@@ -315,13 +1178,76 @@
          if !self.read_only {
              window.request_text_input();
          }
-@@ -1326,12 +1467,21 @@
+@@ -1214,9 +1852,16 @@
+             }
+             PressIntent::SelectWord => {
+                 let index = self.index_for_mouse_position(event.position);
+-                let range = crate::text::selection::word_range(&self.content, index);
+-                self.move_to(range.start, cx);
+-                self.select_to(range.end, cx);
++                let range = if self.large_file {
++                    self.content.line_range_at(index)
++                } else {
++                    0..self.content.len()
++                };
++                let start = range.start;
++                let word =
++                    crate::text::selection::word_range(&self.content.slice(range), index - start);
++                self.move_to(start + word.start, cx);
++                self.select_to(start + word.end, cx);
+             }
+             PressIntent::ExtendSelection => {
+                 self.select_to(self.index_for_mouse_position(event.position), cx);
+@@ -1227,14 +1872,40 @@
+         }
+     }
+
+-    fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
++    fn on_mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
++        if let Some(drag) = self.scrollbar_drag.take() {
++            self.scroll_to_drag_position(event.position, drag);
++            cx.notify();
++        }
+         self.is_selecting = false;
+         self.drag_position = None;
+         self.drag_generation = self.drag_generation.wrapping_add(1);
+         self.drag_autoscroll_active = false;
+     }
+
+-    fn on_mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
++    fn on_mouse_move(
++        &mut self,
++        event: &MouseMoveEvent,
++        window: &mut Window,
++        cx: &mut Context<Self>,
++    ) {
++        if let Some(drag) = self.scrollbar_drag {
++            if self.scroll_to_drag_position(event.position, drag) && !self.scrollbar_frame_pending {
++                // Apply every pointer position but draw only the latest one
++                // when the platform is ready to present the next frame.
++                self.scrollbar_frame_pending = true;
++                let editor = cx.entity().downgrade();
++                window.on_next_frame(move |_, cx| {
++                    let _ = editor.update(cx, |input, cx| {
++                        input.scrollbar_frame_pending = false;
++                        if input.scrollbar_drag.is_some() {
++                            cx.notify();
++                        }
++                    });
++                });
++            }
++            return;
++        }
+         if self.is_selecting {
+             self.drag_position = Some(event.position);
+             let position = self.drag_selection_position(event.position);
+@@ -1326,12 +1997,21 @@
          };
          let viewport_height = f32::from(bounds.size.height);
          let max_scroll = (self.content_height - viewport_height).max(0.0);
 -        if max_scroll == 0.0 {
-+        let max_horizontal = if self.markdown {
-+            (self.content_width - f32::from(bounds.size.width)).max(0.0)
++        let max_horizontal = if self.markdown || self.large_file {
++            self.max_scroll_left(f32::from(bounds.size.width))
 +        } else {
 +            0.0
 +        };
@@ -340,16 +1266,111 @@
              if delta != 0.0 {
                  cx.stop_propagation();
              }
-@@ -1378,7 +1528,7 @@
+@@ -1344,29 +2024,28 @@
      }
- 
+
+     fn offset_from_utf16(&self, offset: usize) -> usize {
+-        let mut utf8_offset = 0;
+-        let mut utf16_count = 0;
+-        for character in self.content.chars() {
+-            if utf16_count >= offset {
+-                break;
+-            }
+-            utf16_count += character.len_utf16();
+-            utf8_offset += character.len_utf8();
+-        }
+-        utf8_offset
++        match &self.content {
++            TextBuffer::Plain(text) => utf16_offset_to_utf8(text, offset),
++            TextBuffer::Large(rope) => {
++                let offset = offset.min(rope.len_utf16_cu());
++                let char_index = rope.utf16_cu_to_char(offset);
++                let inside_surrogate = rope.char_to_utf16_cu(char_index) < offset;
++                rope.char_to_byte(char_index + usize::from(inside_surrogate))
++            }
++        }
+     }
+
+     fn offset_to_utf16(&self, offset: usize) -> usize {
+-        let mut utf16_offset = 0;
+-        let mut utf8_count = 0;
+-        for character in self.content.chars() {
+-            if utf8_count >= offset {
+-                break;
+-            }
+-            utf8_count += character.len_utf8();
+-            utf16_offset += character.len_utf16();
+-        }
+-        utf16_offset
++        match &self.content {
++            TextBuffer::Plain(text) => {
++                let mut end = offset.min(text.len());
++                while !text.is_char_boundary(end) {
++                    end += 1;
++                }
++                text[..end].encode_utf16().count()
++            }
++            TextBuffer::Large(rope) => rope.char_to_utf16_cu(rope.byte_to_char(offset)),
++        }
+     }
+
+     fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
+@@ -1377,13 +2056,50 @@
+         self.offset_from_utf16(range.start)..self.offset_from_utf16(range.end)
+     }
+
++    fn prepare_text_layout(&mut self, style: &TextStyle, rem_size: Pixels) {
++        let selection = self.markdown.then_some(&self.selected_range);
++        if self.layout_key.as_ref().is_some_and(|key| {
++            &key.style == style
++                && key.rem_size == rem_size
++                && key.selection.as_ref() == selection
++                && key.marked == self.marked_range
++        }) {
++            return;
++        }
++        self.layout_key = Some(EditorLayoutKey {
++            style: style.clone(),
++            rem_size,
++            selection: selection.cloned(),
++            marked: self.marked_range.clone(),
++        });
++        self.layout_width = None;
++        self.layout_rows = None;
++        self.measured_heights.clear();
++    }
++
++    fn measure_text(&mut self, width: Pixels, style: &TextStyle, window: &mut Window) -> f32 {
++        self.prepare_text_layout(style, window.rem_size());
++        // Flex layout can ask about several widths per frame. Keep those heights
++        // separately so its probes do not evict the actual editor layout.
++        if let Some((_, height)) = self.measured_heights.iter().find(|(w, _)| *w == width) {
++            return *height;
++        }
++        self.layout_text(width, style, window)
++    }
++
      fn layout_text(&mut self, width: Pixels, style: &TextStyle, window: &mut Window) -> f32 {
 -        let (display, is_placeholder) = if self.content.is_empty() {
++        let rem_size = window.rem_size();
++        self.prepare_text_layout(style, rem_size);
++        if self.layout_width == Some(width) {
++            return self.content_height;
++        }
++        self.layout_rows = None;
++        self.line_origin_y = px(0.0);
 +        let (mut display, is_placeholder) = if self.content.is_empty() {
              (self.placeholder.clone(), true)
          } else {
-             (SharedString::from(self.content.clone()), false)
-@@ -1407,40 +1557,92 @@
+-            (SharedString::from(self.content.clone()), false)
+-        };
+-        let rem_size = window.rem_size();
++            (SharedString::from(self.content.text().into_owned()), false)
++        };
+         let font_size = style.font_size.to_pixels(rem_size);
+         self.font_size = font_size;
+         // Taffy measures after parent `with_text_style` is gone, so
+@@ -1407,45 +2123,212 @@
              }),
              strikethrough: None,
          };
@@ -363,6 +1384,7 @@
 -            .filter(|run| run.len > 0)
 -            .collect(),
 -            _ => vec![run(display.len(), false)],
+-        };
 +        let runs = if self.markdown && !is_placeholder {
 +            let image_rows =
 +                (f32::from(self.image_height(width)) / f32::from(self.line_height)) as usize;
@@ -400,7 +1422,8 @@
 +                .collect(),
 +                _ => vec![run(display.len(), false)],
 +            }
-         };
++        };
++        self.display_text = display.clone();
          let wrap_width = self.multiline.then_some(width);
 -        let lines = window
 -            .text_system()
@@ -416,6 +1439,11 @@
 -        if line_starts.is_empty() {
 -            line_starts.push(0);
 -        }
+-        self.content_height = lines
+-            .iter()
+-            .map(|line| f32::from(line.size(self.line_height).height))
+-            .sum::<f32>()
+-            .max(f32::from(self.line_height));
 +        let (lines, line_starts, line_heights) = if let Some(map) = &self.display_map {
 +            shape_lines(
 +                &display,
@@ -440,20 +1468,10 @@
 +                line_starts.push(offset);
 +                offset += line.len() + 1;
 +            }
-+            if line_starts.is_empty() {
-+                line_starts.push(0);
-+            }
 +            let line_heights = vec![self.line_height; lines.len()];
 +            (lines, line_starts, line_heights)
 +        };
 +        self.last_line_heights = line_heights;
-         self.content_height = lines
-             .iter()
--            .map(|line| f32::from(line.size(self.line_height).height))
-+            .enumerate()
-+            .map(|(index, line)| f32::from(line.size(self.line_height_at(index)).height))
-             .sum::<f32>()
-             .max(f32::from(self.line_height));
          self.content_width = lines
              .iter()
 -            .map(|line| f32::from(line.unwrapped_layout.width))
@@ -468,7 +1486,135 @@
              .fold(0.0, f32::max);
          self.display_is_placeholder = is_placeholder;
          self.last_lines = lines;
-@@ -1454,12 +1656,14 @@
+         self.line_starts = line_starts;
++        self.rebuild_line_tops();
++        self.content_height = f32::from(
++            self.line_tops
++                .last()
++                .copied()
++                .unwrap_or_default()
++                .max(self.line_height),
++        );
++        self.layout_width = Some(width);
++        if !self
++            .measured_heights
++            .iter()
++            .any(|(measured, _)| *measured == width)
++        {
++            if self.measured_heights.len() == 8 {
++                self.measured_heights.pop_front();
++            }
++            self.measured_heights
++                .push_back((width, self.content_height));
++        }
+         self.content_height
++    }
++
++    fn layout_large_file(
++        &mut self,
++        viewport_height: Pixels,
++        full_height: Pixels,
++        style: &TextStyle,
++        window: &mut Window,
++    ) {
++        const OVERSCAN_ROWS: usize = 8;
++        let rem_size = window.rem_size();
++        self.prepare_text_layout(style, rem_size);
++        self.layout_width = None;
++        let dragging = self.dragging_vertical_scrollbar();
++        let cursor = self.cursor_offset();
++        let TextBuffer::Large(rope) = &self.content else {
++            return;
++        };
++        let row_count = rope.len_lines();
++        let font_size = style.font_size.to_pixels(rem_size);
++        self.font_size = font_size;
++        self.line_height = style.line_height_in_pixels(rem_size).max(px(1.0));
++        let row_height = f32::from(self.line_height);
++        let height = f32::from(viewport_height);
++        self.content_height = row_count as f32 * row_height;
++        if self.follow_cursor {
++            let row = rope.byte_to_line(cursor);
++            let top = row as f32 * row_height;
++            self.scroll_top = self.scroll_top.min(top).max(top + row_height - height);
++        }
++        self.scroll_top = self
++            .scroll_top
++            .clamp(0.0, (self.content_height - height).max(0.0));
++        // A thumb move can jump dozens of rows at once. Shape only the
++        // visible rows during the drag, then restore overscan on release.
++        let overscan = if dragging { 0 } else { OVERSCAN_ROWS };
++        let layout_height = if dragging {
++            height
++        } else {
++            f32::from(full_height)
++        };
++        let first = ((self.scroll_top / row_height) as usize).saturating_sub(overscan);
++        let last = (((self.scroll_top + layout_height) / row_height).ceil() as usize
++            + overscan
++            + usize::from(!dragging))
++        .min(row_count);
++        let rows = first..last;
++        if self.layout_rows.as_ref() == Some(&rows) {
++            return;
++        }
++        self.layout_rows = Some(rows);
++        let start = rope.line_to_byte(first);
++        let end = if last < row_count {
++            rope.line_to_byte(last) - 1
++        } else {
++            rope.len_bytes()
++        };
++        let display = self.content.slice(start..end);
++        let run = |len, underline: bool| TextRun {
++            len,
++            font: style.font(),
++            color: style.color,
++            background_color: None,
++            underline: underline.then_some(UnderlineStyle {
++                color: Some(style.color),
++                thickness: px(1.0),
++                wavy: false,
++            }),
++            strikethrough: None,
++        };
++        let runs = match &self.marked_range {
++            Some(marked) if marked.start < end && marked.end > start => {
++                let marked_start = marked.start.max(start);
++                let marked_end = marked.end.min(end);
++                vec![
++                    run(marked_start - start, false),
++                    run(marked_end - marked_start, true),
++                    run(end - marked_end, false),
++                ]
++            }
++            _ => vec![run(display.len(), false)],
++        };
++        self.last_lines = window
++            .text_system()
++            .shape_text(display.into_owned().into(), font_size, &runs, None, None)
++            .map(|lines| lines.into_vec())
++            .unwrap_or_default();
++        self.line_starts.clear();
++        let mut offset = start;
++        for line in &self.last_lines {
++            self.line_starts.push(offset);
++            offset += line.len() + 1;
++        }
++        self.line_origin_y = px(first as f32 * row_height);
++        self.last_line_heights.clear();
++        self.rebuild_line_tops();
++        self.content_width = self
++            .last_lines
++            .iter()
++            .map(|line| f32::from(line.unwrapped_layout.width))
++            .fold(0.0, f32::max);
++        self.display_map = None;
++        self.display_is_placeholder = false;
+     }
+
+     fn clamp_scroll(&mut self, viewport_width: f32, viewport_height: f32) {
+@@ -1454,12 +2337,14 @@
                  let cursor_top = f32::from(cursor.y);
                  if cursor_top < self.scroll_top {
                      self.scroll_top = cursor_top;
@@ -482,24 +1628,46 @@
 +                        - viewport_height;
                  }
 -                if !self.multiline {
-+                if !self.multiline || self.markdown {
++                if !self.multiline || self.markdown || self.large_file {
                      let cursor_left = f32::from(cursor.x);
                      if cursor_left < self.scroll_left {
                          self.scroll_left = cursor_left;
-@@ -1472,7 +1676,7 @@
+@@ -1472,12 +2357,9 @@
          self.scroll_top = self
              .scroll_top
              .clamp(0.0, (self.content_height - viewport_height).max(0.0));
 -        self.scroll_left = if self.multiline {
-+        self.scroll_left = if self.multiline && !self.markdown {
-             0.0
-         } else {
-             self.scroll_left
-@@ -1542,8 +1746,24 @@
+-            0.0
+-        } else {
+-            self.scroll_left
+-                .clamp(0.0, (self.content_width + 2.0 - viewport_width).max(0.0))
+-        };
++        self.scroll_left = self
++            .scroll_left
++            .clamp(0.0, self.max_scroll_left(viewport_width));
+     }
+ }
+
+@@ -1491,7 +2373,7 @@
+     ) -> Option<String> {
+         let range = self.range_from_utf16(&range_utf16);
+         actual_range.replace(self.range_to_utf16(&range));
+-        self.content.get(range).map(str::to_string)
++        (range.start <= range.end).then(|| self.content.slice(range).into_owned())
+     }
+
+     fn selected_text_range(
+@@ -1540,15 +2422,37 @@
+         if self.marked_range.is_none() {
+             self.record_edit(&range, &replacement, cx.background_executor().now());
          }
-         self.content =
-             self.content[..range.start].to_owned() + &replacement + &self.content[range.end..];
+-        self.content =
+-            self.content[..range.start].to_owned() + &replacement + &self.content[range.end..];
 -        let cursor = range.start + replacement.len();
++        let changed_range =
++            (self.large_file && self.emits_change).then(|| self.range_to_utf16(&range));
++        self.content.replace(range.clone(), &replacement);
++        self.layout_key = None;
 +        let mut cursor = range.start + replacement.len();
          self.selected_range = cursor..cursor;
 +        if self.markdown
@@ -508,11 +1676,11 @@
 +            && range.is_empty()
 +            && new_text == "-"
 +        {
-+            if let Some(edit) = smart_em_dash(&self.content, cursor) {
++            if let Some(edit) = smart_em_dash(&self.content.text(), cursor) {
 +                // Snapshot the two literal hyphens so one Undo can cancel
 +                // the substitution independently of the user's typing.
 +                self.record_edit(&edit.range, &edit.text, cx.background_executor().now());
-+                self.content.replace_range(edit.range.clone(), &edit.text);
++                self.content.replace(edit.range.clone(), &edit.text);
 +                cursor = edit.range.start + edit.text.len();
 +                self.selected_range = cursor..cursor;
 +                self.last_edit = None;
@@ -521,7 +1689,43 @@
          self.selection_reversed = false;
          self.marked_range = None;
          self.follow_cursor = true;
-@@ -1610,7 +1830,7 @@
+         self.reset_blink(cx);
+-        self.emit_change();
++        if let Some(range) = changed_range {
++            self.emit_edit(range, replacement);
++        } else {
++            self.emit_change();
++        }
+         cx.notify();
+     }
+
+@@ -1579,8 +2483,10 @@
+         } else {
+             single_line_text(new_text)
+         };
+-        self.content =
+-            self.content[..range.start].to_owned() + &replacement + &self.content[range.end..];
++        let changed_range =
++            (self.large_file && self.emits_change).then(|| self.range_to_utf16(&range));
++        self.content.replace(range.clone(), &replacement);
++        self.layout_key = None;
+         self.marked_range =
+             (!replacement.is_empty()).then_some(range.start..range.start + replacement.len());
+         self.selected_range = new_selected_range_utf16
+@@ -1592,7 +2498,11 @@
+             .unwrap_or_else(|| range.start + replacement.len()..range.start + replacement.len());
+         self.follow_cursor = true;
+         self.reset_blink(cx);
+-        self.emit_change();
++        if let Some(range) = changed_range {
++            self.emit_edit(range, replacement);
++        } else {
++            self.emit_change();
++        }
+         cx.notify();
+     }
+
+@@ -1610,7 +2520,7 @@
                  bounds.left() + start.x - px(self.scroll_left),
                  bounds.top() + start.y - px(self.scroll_top),
              ),
@@ -529,8 +1733,20 @@
 +            self.height_for_index(range.start),
          ))
      }
- 
-@@ -1655,6 +1875,8 @@
+
+@@ -1637,7 +2547,10 @@
+     }
+
+     fn text_length_utf16(&mut self, _: &mut Window, _: &mut Context<Self>) -> Option<usize> {
+-        Some(self.content.encode_utf16().count())
++        Some(match &self.content {
++            TextBuffer::Plain(text) => text.encode_utf16().count(),
++            TextBuffer::Large(rope) => rope.len_utf16_cu(),
++        })
+     }
+
+     fn accepts_text_input(&self, _: &mut Window, _: &mut Context<Self>) -> bool {
+@@ -1655,6 +2568,8 @@
                  INPUT_KEY_CONTEXT
              } else if self.emits_submit {
                  TEXTAREA_SUBMIT_KEY_CONTEXT
@@ -539,7 +1755,7 @@
              } else {
                  TEXTAREA_KEY_CONTEXT
              })
-@@ -1693,6 +1915,9 @@
+@@ -1693,6 +2608,9 @@
              .on_action(cx.listener(Self::undo))
              .on_action(cx.listener(Self::redo))
              .on_action(cx.listener(Self::newline))
@@ -549,35 +1765,48 @@
              .on_action(cx.listener(Self::submit))
              .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
              .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
-@@ -1719,10 +1944,12 @@
+@@ -1719,10 +2637,13 @@
              })
              .w_full()
              .min_w_0()
-+            .when(self.markdown, |editor| editor.h_full())
++            .when(self.markdown || self.large_file, |editor| editor.h_full())
              .child(EditorTextElement {
                  input: cx.entity(),
                  min_rows: self.min_rows,
                  max_rows: self.max_rows,
-+                fill_height: self.markdown,
++                fill_height: self.markdown || self.large_file,
++                scrollbar: self.scrollbar,
              })
      }
  }
-@@ -1731,11 +1958,13 @@
+@@ -1731,15 +2652,20 @@
      input: Entity<TextEditorState>,
      min_rows: usize,
      max_rows: usize,
 +    fill_height: bool,
++    scrollbar: bool,
  }
- 
+
  struct EditorPrepaint {
++    text_bounds: Bounds<Pixels>,
++    scrollbars: [Option<(EditorScrollbar, Hitbox)>; 2],
      caret: Option<PaintQuad>,
      selection: Vec<PaintQuad>,
 +    images: Vec<gpui::AnyElement>,
  }
- 
+
  impl gpui::Element for EditorTextElement {
-@@ -1759,10 +1988,14 @@
-     ) -> (LayoutId, ()) {
+-    type RequestLayoutState = ();
++    type RequestLayoutState = TextStyle;
+     type PrepaintState = EditorPrepaint;
+
+     fn id(&self) -> Option<gpui::ElementId> {
+@@ -1756,27 +2682,44 @@
+         _: Option<&gpui::InspectorElementId>,
+         window: &mut Window,
+         _: &mut App,
+-    ) -> (LayoutId, ()) {
++    ) -> (LayoutId, TextStyle) {
          let mut style = Style::default();
          style.size.width = relative(1.0).into();
 +        if self.fill_height {
@@ -585,14 +1814,25 @@
 +        }
          let input = self.input.clone();
          let text_style = window.text_style();
++        let measure_style = text_style.clone();
          let min_rows = self.min_rows;
          let max_rows = self.max_rows.max(min_rows);
 +        let fill_height = self.fill_height;
++        let scrollbar = self.scrollbar;
          let layout = window.request_measured_layout(style, move |known, available, window, cx| {
              let width = known.width.unwrap_or(match available.width {
                  gpui::AvailableSpace::Definite(width) => width,
-@@ -1772,8 +2005,13 @@
-                 let content_height = input.layout_text(width, &text_style, window);
+                 _ => px(320.0),
+             });
+             let (content_height, line_height) = input.update(cx, |input, _| {
+-                let content_height = input.layout_text(width, &text_style, window);
++                if input.large_file {
++                    let line_height =
++                        f32::from(measure_style.line_height_in_pixels(window.rem_size()));
++                    return (line_height, line_height);
++                }
++                let content_width = width - scrollbar_gutter(scrollbar, width);
++                let content_height = input.measure_text(content_width, &measure_style, window);
                  (content_height, f32::from(input.line_height))
              });
 -            let height =
@@ -605,71 +1845,161 @@
 +            };
              size(width, px(height))
          });
-         (layout, ())
-@@ -1785,7 +2023,7 @@
+-        (layout, ())
++        (layout, text_style)
+     }
+
+     fn prepaint(
+@@ -1784,13 +2727,56 @@
+         _: Option<&GlobalElementId>,
          _: Option<&gpui::InspectorElementId>,
          bounds: Bounds<Pixels>,
-         _: &mut (),
+-        _: &mut (),
 -        _: &mut Window,
++        text_style: &mut TextStyle,
 +        window: &mut Window,
          cx: &mut App,
      ) -> EditorPrepaint {
++        let right_gutter = scrollbar_gutter(self.scrollbar, bounds.size.width);
++        let mut bounds = bounds;
++        bounds.size.width -= right_gutter;
          self.input.update(cx, |input, _| {
-@@ -1806,7 +2044,7 @@
-             caret = Some(fill(
-                 caret_rect(
-                     point(origin.x + caret_point.x, origin.y + caret_point.y),
++            let height = bounds.size.height;
++            let width = f32::from(bounds.size.width);
++            let bottom_space = scrollbar_gutter(self.scrollbar, height);
++            let virtual_layout = input.large_file && !input.content.is_empty();
++            let previous_gutter = input.scrollbar_gutters.height.min(bottom_space);
++            let scroll_top = input.scroll_top;
++            if virtual_layout {
++                input.layout_large_file(height - previous_gutter, height, text_style, window);
++            } else {
++                input.layout_text(bounds.size.width, text_style, window);
++            }
++
++            let bottom_gutter = if input.dragging_vertical_scrollbar() {
++                // Hold the track length steady if the drag passes between
++                // short and wide rows.
++                previous_gutter
++            } else if input.max_scroll_left(width) > f32::from(CARET_WIDTH) {
++                bottom_space
++            } else {
++                px(0.0)
++            };
++            bounds.size.height -= bottom_gutter;
++            if virtual_layout && bottom_gutter != previous_gutter {
++                // Keep the requested vertical offset when the bottom bar changes
++                // the viewport. The first layout may have clamped it early.
++                let content_width = input.content_width;
++                let previous_limit = input.content_height - f32::from(height - previous_gutter);
++                input.scroll_top =
++                    if !input.follow_cursor && previous_limit > 0.0 && scroll_top >= previous_limit
++                    {
++                        (input.content_height - f32::from(bounds.size.height)).max(0.0)
++                    } else {
++                        scroll_top
++                    };
++                input.layout_large_file(bounds.size.height, height, text_style, window);
++                if bottom_gutter > px(0.0) {
++                    input.content_width = input.content_width.max(content_width);
++                }
++            }
++            input.scrollbar_gutters = size(right_gutter, bottom_gutter);
+             input.last_bounds = Some(bounds);
+-            input.clamp_scroll(f32::from(bounds.size.width), f32::from(bounds.size.height));
++            input.clamp_scroll(width, f32::from(bounds.size.height));
+         });
+         let input = self.input.read(cx);
+         let origin = point(
+@@ -1799,27 +2785,43 @@
+         );
+         let mut selection = Vec::new();
+         let mut caret = None;
++        let mut selected = input.selected_range.clone();
++        if input.large_file && !input.display_is_placeholder {
++            if let (Some(first), Some(last), Some(line)) = (
++                input.line_starts.first(),
++                input.line_starts.last(),
++                input.last_lines.last(),
++            ) {
++                selected.start = selected.start.max(*first);
++                selected.end = selected.end.min(last + line.len());
++            }
++        }
+         if input.selected_range.is_empty() || input.display_is_placeholder {
+-            let caret_point = input
+-                .point_for_index(input.cursor_offset())
+-                .unwrap_or(point(px(0.0), px(0.0)));
+-            caret = Some(fill(
+-                caret_rect(
+-                    point(origin.x + caret_point.x, origin.y + caret_point.y),
 -                    input.line_height,
-+                    input.height_for_index(input.cursor_offset()),
-                 ),
-                 input.caret_color,
-             ));
-@@ -1819,7 +2057,10 @@
+-                ),
+-                input.caret_color,
+-            ));
+-        } else if let (Some(start), Some(end)) = (
+-            input.point_for_index(input.selected_range.start),
+-            input.point_for_index(input.selected_range.end),
++            if let Some(caret_point) = input.point_for_index(input.cursor_offset()).or_else(|| {
++                (!input.large_file || input.display_is_placeholder).then(|| point(px(0.0), px(0.0)))
++            }) {
++                caret = Some(fill(
++                    caret_rect(
++                        point(origin.x + caret_point.x, origin.y + caret_point.y),
++                        input.height_for_index(input.cursor_offset()),
++                    ),
++                    input.caret_color,
++                ));
++            }
++        } else if let (true, Some(start), Some(end)) = (
++            selected.start < selected.end,
++            input.point_for_index(selected.start),
++            input.point_for_index(selected.end),
+         ) {
+             let color = gpui::rgba(0x7c86ff59);
+             if start.y == end.y {
                  selection.push(fill(
                      Bounds::from_corners(
                          point(origin.x + start.x, origin.y + start.y),
 -                        point(origin.x + end.x, origin.y + start.y + input.line_height),
 +                        point(
 +                            origin.x + end.x,
-+                            origin.y + start.y + input.height_for_index(input.selected_range.start),
++                            origin.y + start.y + input.height_for_index(selected.start),
 +                        ),
                      ),
                      color,
                  ));
-@@ -1827,14 +2068,22 @@
+@@ -1827,14 +2829,20 @@
                  selection.push(fill(
                      Bounds::from_corners(
                          point(origin.x + start.x, origin.y + start.y),
 -                        point(bounds.right(), origin.y + start.y + input.line_height),
 +                        point(
 +                            bounds.right(),
-+                            origin.y + start.y + input.height_for_index(input.selected_range.start),
++                            origin.y + start.y + input.height_for_index(selected.start),
 +                        ),
                      ),
                      color,
                  ));
 -                if end.y > start.y + input.line_height {
-+                if end.y > start.y + input.height_for_index(input.selected_range.start) {
++                if end.y > start.y + input.height_for_index(selected.start) {
                      selection.push(fill(
                          Bounds::from_corners(
 -                            point(origin.x, origin.y + start.y + input.line_height),
 +                            point(
 +                                origin.x,
-+                                origin.y
-+                                    + start.y
-+                                    + input.height_for_index(input.selected_range.start),
++                                origin.y + start.y + input.height_for_index(selected.start),
 +                            ),
                              point(bounds.right(), origin.y + end.y),
                          ),
                          color,
-@@ -1843,13 +2092,107 @@
+@@ -1843,25 +2851,128 @@
                  selection.push(fill(
                      Bounds::from_corners(
                          point(origin.x, origin.y + end.y),
 -                        point(origin.x + end.x, origin.y + end.y + input.line_height),
 +                        point(
 +                            origin.x + end.x,
-+                            origin.y + end.y + input.height_for_index(input.selected_range.end),
++                            origin.y + end.y + input.height_for_index(selected.end),
 +                        ),
                      ),
                      color,
@@ -764,67 +2094,231 @@
 +            });
 +            images.push(element);
 +        }
++        let scrollbars = [Axis::Vertical, Axis::Horizontal].map(|axis| {
++            self.input.read(cx).scrollbar_geometry(axis).map(|bar| {
++                let hitbox = window.insert_hitbox(bar.track, HitboxBehavior::Normal);
++                (bar, hitbox)
++            })
++        });
 +        EditorPrepaint {
++            text_bounds: bounds,
++            scrollbars,
 +            caret,
 +            selection,
 +            images,
 +        }
      }
- 
+
      fn paint(
-@@ -1878,16 +2221,19 @@
+         &mut self,
+         _: Option<&GlobalElementId>,
+         _: Option<&gpui::InspectorElementId>,
+-        bounds: Bounds<Pixels>,
+-        _: &mut (),
++        _: Bounds<Pixels>,
++        text_style: &mut TextStyle,
+         prepaint: &mut EditorPrepaint,
+         window: &mut Window,
+         cx: &mut App,
+     ) {
++        let bounds = prepaint.text_bounds;
+         let focus_handle = self.input.read(cx).focus_handle.clone();
+         window.handle_input(
+             &focus_handle,
+@@ -1869,46 +2980,46 @@
+             cx,
+         );
+         let input = self.input.clone();
+-        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
++        window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+             if phase == DispatchPhase::Bubble && event.pressed_button == Some(MouseButton::Left) {
+-                input.update(cx, |input, cx| input.on_mouse_move(event, cx));
++                input.update(cx, |input, cx| input.on_mouse_move(event, window, cx));
+             }
+         });
+         window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
              for quad in prepaint.selection.drain(..) {
                  window.paint_quad(quad);
              }
 -            let (lines, line_height, scroll_top, scroll_left, display) =
-+            let (lines, line_height, line_heights, scroll_top, scroll_left, display) =
-                 self.input.update(cx, |input, _| {
-                     let display = if input.content.is_empty() {
-                         input.placeholder.clone()
-+                    } else if let Some(map) = &input.display_map {
-+                        map.text.clone()
-                     } else {
-                         input.content.clone().into()
-                     };
-                     (
-                         std::mem::take(&mut input.last_lines),
-                         input.line_height,
-+                        input.last_line_heights.clone(),
-                         input.scroll_top,
-                         input.scroll_left,
-                         display,
-@@ -1895,7 +2241,8 @@
-                 });
-             crate::text::log_painted_text(display);
-             let mut y = bounds.top() - px(scroll_top);
+-                self.input.update(cx, |input, _| {
+-                    let display = if input.content.is_empty() {
+-                        input.placeholder.clone()
+-                    } else {
+-                        input.content.clone().into()
+-                    };
+-                    (
+-                        std::mem::take(&mut input.last_lines),
+-                        input.line_height,
+-                        input.scroll_top,
+-                        input.scroll_left,
+-                        display,
+-                    )
+-                });
+-            crate::text::log_painted_text(display);
+-            let mut y = bounds.top() - px(scroll_top);
 -            for line in &lines {
-+            for (index, line) in lines.iter().enumerate() {
-+                let line_height = line_heights.get(index).copied().unwrap_or(line_height);
-                 let height = line.size(line_height).height;
-                 line.paint(
-                     point(bounds.left() - px(scroll_left), y),
-@@ -1909,6 +2256,9 @@
-                 y += height;
-             }
-             self.input.update(cx, |input, _| input.last_lines = lines);
+-                let height = line.size(line_height).height;
+-                line.paint(
+-                    point(bounds.left() - px(scroll_left), y),
+-                    line_height,
+-                    gpui::TextAlign::Left,
+-                    Some(bounds),
+-                    window,
+-                    cx,
+-                )
+-                .ok();
+-                y += height;
+-            }
+-            self.input.update(cx, |input, _| input.last_lines = lines);
++            self.input.update(cx, |input, cx| {
++                let display = if input.large_file && !input.display_is_placeholder {
++                    input
++                        .last_lines
++                        .iter()
++                        .map(|line| line.text.as_ref())
++                        .collect::<Vec<_>>()
++                        .join("\n")
++                        .into()
++                } else {
++                    input.display_text.clone()
++                };
++                crate::text::log_painted_text(display);
++                let x = bounds.left() - px(input.scroll_left);
++                let y = bounds.top() - px(input.scroll_top) + input.line_origin_y;
++                for index in input.visible_lines(bounds.size.height) {
++                    input.last_lines[index]
++                        .paint(
++                            point(x, y + input.line_tops[index]),
++                            input.line_height_at(index),
++                            gpui::TextAlign::Left,
++                            Some(bounds),
++                            window,
++                            cx,
++                        )
++                        .ok();
++                }
++            });
 +            for image in &mut prepaint.images {
 +                image.paint(window, cx);
 +            }
              let caret_shown = self
                  .input
                  .update(cx, |input, cx| input.caret_shown(window, cx));
+@@ -1918,6 +3029,19 @@
+                 }
+             }
+         });
++        let color = text_style.color;
++        let dragged_axis = self.input.read(cx).scrollbar_drag.map(|drag| drag.bar.axis);
++        for (bar, hitbox) in prepaint.scrollbars.iter().flatten() {
++            window.set_cursor_style(CursorStyle::Arrow, hitbox);
++            let active = dragged_axis == Some(bar.axis) || hitbox.is_hovered(window);
++            window.paint_quad(
++                fill(bar.painted_track(), color.opacity(0.07)).corner_radii(SCROLLBAR_INSET),
++            );
++            window.paint_quad(
++                fill(bar.thumb, color.opacity(if active { 0.55 } else { 0.30 }))
++                    .corner_radii(SCROLLBAR_INSET),
++            );
++        }
+     }
+ }
+
+@@ -2174,13 +3298,48 @@
+     }
+
+     #[test]
++    fn rope_caret_respects_graphemes_across_chunks() {
++        let text = "a👩‍💻🇵🇭é\r\n".repeat(512);
++        let rope = TextBuffer::new(text.clone(), true);
++        let TextBuffer::Large(chunks) = &rope else {
++            unreachable!()
++        };
++        let boundaries: Vec<_> = text
++            .grapheme_indices(true)
++            .map(|(i, _)| i)
++            .chain(std::iter::once(text.len()))
++            .collect();
++        let mut offset = 0;
++        for chunk in chunks.chunks() {
++            for i in text[offset..offset + chunk.len()]
++                .char_indices()
++                .map(|(i, _)| offset + i)
++            {
++                let before = boundaries.partition_point(|&boundary| boundary < i);
++                let after = boundaries.partition_point(|&boundary| boundary <= i);
++                assert_eq!(
++                    rope.grapheme_boundary(i, false),
++                    boundaries[before.saturating_sub(1)],
++                    "before {i}"
++                );
++                assert_eq!(
++                    rope.grapheme_boundary(i, true),
++                    boundaries[after],
++                    "after {i}"
++                );
++            }
++            offset += chunk.len();
++        }
++    }
++
++    #[test]
+     fn undo_history_discards_only_the_oldest_snapshot_at_the_limit() {
+         let mut history = VecDeque::new();
+         for index in 0..=UNDO_LIMIT {
+             push_undo_snapshot(
+                 &mut history,
+                 EditSnapshot {
+-                    content: index.to_string(),
++                    content: TextBuffer::Plain(index.to_string()),
+                     selected_range: index..index,
+                     selection_reversed: false,
+                 },
+@@ -2188,8 +3347,11 @@
+         }
+
+         assert_eq!(history.len(), UNDO_LIMIT);
+-        assert_eq!(history.front().unwrap().content, "1");
+-        assert_eq!(history.back().unwrap().content, UNDO_LIMIT.to_string());
++        assert_eq!(history.front().unwrap().content.text(), "1");
++        assert_eq!(
++            history.back().unwrap().content.text(),
++            UNDO_LIMIT.to_string()
++        );
+     }
+
+     #[test]
 --- a/packages/native/src/custom_elements/mod.rs
 +++ b/packages/native/src/custom_elements/mod.rs
-@@ -19,6 +19,9 @@
+@@ -16,9 +16,13 @@
+ pub mod anchored;
+ pub mod code;
+ pub mod diff;
++pub(crate) mod file_buffer;
  pub mod img;
  pub mod input;
  pub mod markdown;
 +mod markdown_input;
 +mod markdown_blocks;
 +mod markdown_syntax;
- 
+
  // ── Render context ───────────────────────────────────────────────────
- 
+
+@@ -267,10 +271,10 @@
+     fn sync(&mut self, props: &HashMap<String, serde_json::Value>) {
+         let supported_props = self.element.supported_props();
+         for &key in supported_props {
+-            let value = props.get(key).cloned().unwrap_or(serde_json::Value::Null);
+-            if self.applied_props.get(key) != Some(&value) {
++            let value = props.get(key).unwrap_or(&serde_json::Value::Null);
++            if self.applied_props.get(key) != Some(value) {
+                 self.element.set_prop(key, value.clone());
+-                self.applied_props.insert(key.to_string(), value);
++                self.applied_props.insert(key.to_string(), value.clone());
+             }
+         }
+
 --- a/packages/native/src/custom_elements/img.rs
 +++ b/packages/native/src/custom_elements/img.rs
 @@ -391,7 +391,7 @@
@@ -888,24 +2382,34 @@
    /** `[h1, h2, h3, h4to6]`. A shorter array leaves the rest at their defaults. */
    mdHeadingSizes?: number[]
    mdHeadingLineHeights?: number[]
-@@ -475,6 +476,8 @@
+@@ -475,6 +476,16 @@
  }
- 
+
  export interface TextareaProps extends InputProps {
 +  /** Source-preserving native Markdown formatting; defaults to false. */
 +  markdown?: boolean
++  /** Edit unwrapped plain text with viewport-based layout. */
++  largeFile?: boolean
++  /** Bind to a native document returned by GpuixRenderer.openTextFile. */
++  fileBufferId?: number
++  /** Show draggable scrollbars on the axes where text overflows. */
++  scrollbar?: boolean
++  /** Place the initial caret at the start of the document. */
++  startAtTop?: boolean
    minRows?: number
    maxRows?: number
  }
 --- a/packages/native/Cargo.toml
 +++ b/packages/native/Cargo.toml
-@@ -31,6 +31,8 @@
+@@ -30,7 +30,10 @@
+ thiserror = "2"
  pulldown-cmark = { version = "0.12", default-features = false }
  unicode-segmentation = "1"
++ropey = { version = "1.6.1", default-features = false, features = ["simd"] }
  web-time = "1"
 +linkify = "0.10"
 +unicode-width = "0.2"
- 
+
  # Syntect compiles a grammar's TextMate regexes lazily, on the FIRST highlight
  # of that language, on the frame thread, inside a paint. fancy-regex takes
 --- a/packages/native/Cargo.lock
@@ -918,7 +2422,15 @@
   "log",
   "minisign-verify",
   "napi",
-@@ -2624,6 +2625,7 @@
+@@ -2613,6 +2614,7 @@
+  "pulldown-cmark",
+  "reqwest_client",
+  "rmp-serde",
++ "ropey",
+  "rustc-hash 2.1.1",
+  "semver",
+  "serde",
+@@ -2624,6 +2626,7 @@
   "time",
   "two-face",
   "unicode-segmentation",
@@ -926,7 +2438,7 @@
   "url",
   "wasm-bindgen",
   "web-sys",
-@@ -3386,6 +3388,15 @@
+@@ -3386,6 +3389,15 @@
  version = "0.19.3"
  source = "registry+https://github.com/rust-lang/crates.io-index"
  checksum = "39c29a617ce3df32c08497bdc1ab6e2376e0b17948ac166a2fbe5977c5954cd9"
@@ -939,16 +2451,52 @@
 +dependencies = [
 + "memchr",
 +]
- 
+
  [[package]]
  name = "linktime-proc-macro"
+@@ -5185,6 +5197,16 @@
+ ]
+
+ [[package]]
++name = "ropey"
++version = "1.6.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "93411e420bcd1a75ddd1dc3caf18c23155eda2c090631a85af21ba19e97093b5"
++dependencies = [
++ "smallvec",
++ "str_indices",
++]
++
++[[package]]
+ name = "roxmltree"
+ version = "0.20.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -5822,6 +5844,12 @@
+ version = "1.1.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
++
++[[package]]
++name = "str_indices"
++version = "0.4.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d08889ec5408683408db66ad89e0e1f93dff55c73a4ccc71c427d5b277ee47e6"
+
+ [[package]]
+ name = "strict-num"
 --- a/README.md
 +++ b/README.md
-@@ -3374,6 +3374,57 @@
- 
+@@ -3374,6 +3374,75 @@
+
  ## Documentation
- 
+
 +### Local native Markdown textarea extension
++
++This Journal Tree build also supports `windowDrag: "move"` on a `div` style
++(`window-drag: move` in Svelte CSS). The div's mouse hitbox starts a native
++window move; on macOS, a double-click follows the system titlebar preference.
++Use `hitbox="self"` in Svelte when decorative children should share the drag
++region. Give interactive children `pointer-events: auto` to exclude them.
 +
 +This Journal Tree build adds an opt-in boolean `markdown` prop to `<textarea>`.
 +It uses CommonMark with GFM tables, strikethrough, task lists, and autolinks.
@@ -962,6 +2510,18 @@
 +undo, clipboard operations and IME still use the existing native editor. The
 +extension preserves composition underlines across formatting boundaries.
 +Markdown mode fills the defined viewport height for native caret scrolling.
++The optional `largeFile` textarea prop fills the same viewport with editable
++plain text backed by a Ropey buffer, shapes only nearby unwrapped rows, and
++allows horizontal scrolling. It takes precedence over `markdown`. In this mode,
++ordinary `change` events provide a replacement `value` and UTF-16 offsets
++`startIndex` and `endIndex`. Undo and redo send the complete `value`.
++`GpuixRenderer.openTextFile(path)` reads and prepares text on the native worker
++pool. It returns `source` for small files or a `document` handle for large files.
++Keep the handle while the file is open and pass its `id` as `fileBufferId` to
++bind the textarea to the prepared rope. The textarea updates that document
++even when no change listener is registered. The optional `scrollbar` prop adds
++draggable scrollbars on the axes where text overflows. Set `startAtTop` to start at the
++first line when mounting or replacing the document.
 +In Markdown mode, Tab indents the current or selected lines with a literal tab,
 +painted at four-column stops without rewriting source. Shift-Tab removes one
 +tab or up to four legacy spaces. Tab-indented paragraphs and lists retain their
@@ -1000,11 +2560,11 @@
 +which the local launcher checks before starting the app.
 +
  See [AGENTS.md](https://github.com/remorses/gpuix/blob/main/AGENTS.md) for detailed architecture, communication flow, and contributing guide.
- 
+
  ## License
 --- /dev/null
 +++ b/.changeset/native-markdown-textarea.md
-@@ -0,0 +1,17 @@
+@@ -0,0 +1,25 @@
 +---
 +"@gpuix/native": patch
 +---
@@ -1022,3 +2582,72 @@
 +Render completed unordered bullet prefixes immediately and keep them rendered while typing or continuing lists, preserving editable Markdown source.
 +
 +Highlight editable fenced code using its language label and the native cached Syntect engine, preserving source offsets, monospace layout, composition, and theme syntax colours.
++
++Add an editable large-file textarea mode with a Ropey buffer, incremental edit events, and viewport-based plain-text layout.
++
++Prepare opened text files on the native worker pool and share large document buffers with the textarea by handle.
++
++Add an optional draggable textarea scrollbars and initial top-of-document caret positioning.
++
++Reuse native text layout during scrolling, paint visible lines, and index Markdown source ranges.
+--- a/packages/native/src/style.rs
++++ b/packages/native/src/style.rs
+@@ -220,6 +220,8 @@
+     /// `"auto"` blocks mouse hits behind this element. `"none"` never does.
+     /// Unset: block when this element paints a fill or is absolutely positioned.
+     pub pointer_events: Option<String>,
++    /// `"move"` gives a div's hitbox to native window dragging.
++    pub window_drag: Option<String>,
+
+     // Text selection. "none" opts an element and its subtree out of the
+     // selection registry, so buttons and toolbars never start a drag.
+--- a/packages/native/src/renderer.rs
++++ b/packages/native/src/renderer.rs
+@@ -914,6 +914,13 @@
+ #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+ #[napi]
+ impl GpuixRenderer {
++    /// Read and prepare a text document on the native worker pool.
++    #[cfg(not(target_family = "wasm"))]
++    #[napi]
++    pub fn open_text_file(path: String) -> AsyncTask<crate::custom_elements::file_buffer::OpenTextFileTask> {
++        AsyncTask::new(crate::custom_elements::file_buffer::OpenTextFileTask(path))
++    }
++
+     fn event_callback_for_view(&self) -> Option<EventCallback> {
+         self.event_callback.lock().unwrap().clone().map(|tsf| {
+             Arc::new(move |payload: EventPayload| {
+@@ -5230,6 +5237,33 @@
+         }
+     }
+
++    if style.and_then(|style| style.window_drag.as_deref()) == Some("move") {
++        // Windows moves caption hitboxes itself. On macOS and Linux, GPUI
++        // needs the original native mouse event to start a system move.
++        #[cfg(target_os = "windows")]
++        {
++            el = el.window_control_area(gpui::WindowControlArea::Drag);
++        }
++        #[cfg(any(target_os = "macos", target_os = "linux"))]
++        {
++            el = el.on_mouse_down(gpui::MouseButton::Left, |event, window, cx| {
++                if window.is_fullscreen() {
++                    return;
++                }
++                #[cfg(target_os = "macos")]
++                if event.click_count == 2 {
++                    window.titlebar_double_click();
++                    cx.stop_propagation();
++                    return;
++                }
++                #[cfg(not(target_os = "macos"))]
++                let _ = event;
++                window.start_window_move();
++                cx.stop_propagation();
++            });
++        }
++    }
++
+     // Wire up events.
+     // Some events (on_hover, on_aux_click) require a stateful element (.id()),
+     // which we already set above. Others (on_mouse_down, on_key_down) work

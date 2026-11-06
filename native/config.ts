@@ -14,7 +14,7 @@ export const manifestPath = `${binaryPath}.json`;
 
 export function sourceHash(): string {
 	const hash = createHash('sha256').update(gpuixRevision).update(zedRevision).update(rustVersion);
-	for (const name of ['markdown_input.rs', 'markdown_blocks.rs', 'markdown_syntax.rs', 'textarea.patch']) {
+	for (const name of ['file_buffer.rs', 'markdown_input.rs', 'markdown_blocks.rs', 'markdown_syntax.rs', 'textarea.patch']) {
 		hash.update(readFileSync(join(projectRoot, 'native', name)));
 	}
 	return hash.digest('hex');

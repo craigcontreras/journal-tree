@@ -7,7 +7,9 @@ render_hot(new URL('./App.svelte', import.meta.url), {
 	title: 'Journal Tree',
 	width: 1280,
 	height: 720,
-	titlebarTransparent: true
+	titlebarTransparent: true,
+	trafficLightX: 16,
+	trafficLightY: 19,
 });
 
 //GPUIX-svelte doesn't call exit handlers!!!!

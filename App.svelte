@@ -2,15 +2,41 @@
     import { backendState } from "./lib/backend-process.ts";
 	import axios from "axios";
 	import { onMount } from "svelte";
-	import { set_css_vars } from "gpuix-svelte";
+	import { on_window_key, prompt_for_paths, set_css_vars } from "gpuix-svelte";
 	import MarkdownEditor from './MarkdownEditor.svelte';
+	import FileTabs from './FileTabs.svelte';
 	import { editorState } from './lib/editor-state.svelte.ts';
+	import { fileState, openFiles, selectFile } from './lib/file-state.svelte.ts';
+	import { appState } from "./state.svelte.ts";
 
-	set_css_vars({ surface: '#11111b', panel: '#1e1e2e', divider: '#1e1e2e', text: '#ffffff', 'editor-inset': '32px' });
+	set_css_vars({ surface: '#11111b', panel: '#1e1e2e', divider: '#1e1e2e', text: '#ffffff', 'editor-inset': '32px', 'tab-inactive': '#181825', 'tab-text-muted': '#a6adc8' });
 
 	let count = $state(0);
 	let url = backendState.baseUrl;
 	let response = $state(null);
+
+	const activeNote = $derived(fileState.files.find(file => file.path === fileState.activePath) ?? editorState);
+
+	onMount(() => {
+		let opening = false;
+		return on_window_key('keydown', async (e) => {
+			if (opening || !e.modifiers?.cmd || e.key !== 'o') return;
+			opening = true;
+			try {
+				const paths = await prompt_for_paths({
+					files: true,
+					directories: false,
+					multiple: true,
+					prompt: "Select"
+				});
+				if (paths) await openFiles(paths);
+			} catch (error) {
+				console.error('Could not open files:', error);
+			} finally {
+				opening = false;
+			}
+		});
+	});
 
 	// onMount(async () => {
 	// 	try {
@@ -27,16 +53,10 @@
 </script>
 
 <div class="app">
-	<div class="menubar-row" testid="menubar-row">
+	<div class="menubar-row" testid="menubar-row" hitbox="self">
 		<div class="side-menubar"></div>
 		<div class="sidebar-spacer"></div>
-		<div class="menubar" testid="tab-strip">
-			<div class="tab">
-				<div class="tab-curve left" testid="tab-left-curve"><div class="tab-cutout left"></div></div>
-				<text>file</text>
-				<div class="tab-curve right"><div class="tab-cutout right"></div></div>
-			</div>
-		</div>
+		<FileTabs files={fileState.files} activePath={fileState.activePath} onSelect={selectFile} />
 		<div class="sidebar-spacer"></div>
 	</div>
 	<div class="workspace" testid="workspace">
@@ -44,7 +64,13 @@
 		<div class="sidebar" testid="left-sidebar"></div>
 		<div class="container" testid="editor-column">
 			<div class="card">
-				<MarkdownEditor value={editorState.source} onchange={(e) => editorState.source = e.value} />
+				{#each [activeNote] as note (note)}
+					{#if 'document' in note}
+						<MarkdownEditor fileBufferId={note.document.id} scrollbar />
+					{:else}
+						<MarkdownEditor value={note.source} scrollbar startAtTop={'path' in note} onchange={(e) => note.source = e.value} />
+					{/if}
+				{/each}
 			</div>
 		</div>
 		<div class="sidebar"></div>
@@ -81,6 +107,8 @@
 	}
 
 	.menubar-row {
+		window-drag: move;
+		user-select: none;
 		display: flex;
 		width: 100%;
 		height: 54px;
@@ -104,46 +132,6 @@
 		min-width: 0;
 	}
 
-	.menubar {
-		display: flex;
-		align-items: flex-end;
-		padding-left: 8px;
-		overflow: hidden;
-		flex-grow: 1;
-		min-width: 0;
-	}
-
-	.tab {
-		position: relative;
-		margin-bottom: -2px;
-		padding: 0.5rem 1.25rem;
-		color: var(--text);
-		background-color: var(--panel);
-		border-top-left-radius: 12px;
-		border-top-right-radius: 12px;
-	}
-
-	.tab-curve {
-		position: absolute;
-		bottom: 0;
-		width: 24px;
-		height: 24px;
-		background-color: var(--panel);
-		pointer-events: none;
-	}
-
-	.tab-curve.left { left: -24px; }
-	.tab-curve.right { right: -24px; }
-
-	.tab-cutout {
-		width: 100%;
-		height: 100%;
-		background-color: var(--surface);
-	}
-
-	.tab-cutout.left { border-bottom-right-radius: 24px; }
-	.tab-cutout.right { border-bottom-left-radius: 24px; }
-
 	.card {
 		width: 100%;
 		height: 100%;
@@ -151,7 +139,9 @@
 		flex-direction: column;
 		align-items: center;
 		gap: 16px;
-		padding: var(--editor-inset);
+		padding-top: var(--editor-inset);
+		padding-left: var(--editor-inset);
 		background-color: var(--panel);
 	}
+
 </style>

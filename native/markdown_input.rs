@@ -377,32 +377,31 @@ impl Projection {
     }
 
     pub(super) fn to_display(&self, source: usize) -> usize {
-        for piece in &self.pieces {
-            if source <= piece.source.start {
-                return piece.display.start;
+        // An insertion at this offset has an empty source range, but still
+        // maps to the start of its displayed text.
+        let index = self
+            .pieces
+            .partition_point(|piece| piece.source.start < source && piece.source.end <= source);
+        self.pieces.get(index).map_or(self.text.len(), |piece| {
+            if piece.replacement {
+                piece.display.start
+            } else {
+                piece.display.start + source.saturating_sub(piece.source.start)
             }
-            if source < piece.source.end {
-                return if piece.replacement {
-                    piece.display.start
-                } else {
-                    piece.display.start + source - piece.source.start
-                };
-            }
-        }
-        self.text.len()
+        })
     }
 
     pub(super) fn to_source(&self, display: usize) -> usize {
-        for piece in &self.pieces {
-            if display < piece.display.end {
-                return if piece.replacement {
-                    piece.source.start
-                } else {
-                    piece.source.start + display.saturating_sub(piece.display.start)
-                };
+        let index = self
+            .pieces
+            .partition_point(|piece| piece.display.end <= display);
+        self.pieces.get(index).map_or(self.source_len, |piece| {
+            if piece.replacement {
+                piece.source.start
+            } else {
+                piece.source.start + display.saturating_sub(piece.display.start)
             }
-        }
-        self.source_len
+        })
     }
 
     pub(super) fn project_runs(&self, runs: Vec<TextRun>) -> Vec<TextRun> {
@@ -596,6 +595,17 @@ impl MarkdownCache {
             self.syntax = super::markdown_syntax::highlights(source);
             self.constructs = parse_constructs(source);
             self.blocks = super::markdown_blocks::parse(source);
+            // The parser emits these non-nesting block types in source order.
+            debug_assert!(self
+                .blocks
+                .headings
+                .windows(2)
+                .all(|pair| pair[0].0.end <= pair[1].0.start));
+            debug_assert!(self
+                .blocks
+                .tables
+                .windows(2)
+                .all(|pair| pair[0].end <= pair[1].start));
             self.constructs
                 .extend(self.blocks.constructs.iter().cloned());
             self.source = source.to_owned();
@@ -613,10 +623,11 @@ impl MarkdownCache {
     }
 
     pub(super) fn heading_at(&self, source: usize) -> u8 {
-        self.blocks
-            .headings
-            .iter()
-            .find(|(range, _)| range.start <= source && source < range.end)
+        let headings = &self.blocks.headings;
+        let index = headings.partition_point(|(range, _)| range.end <= source);
+        headings
+            .get(index)
+            .filter(|(range, _)| range.contains(&source))
             .map_or(0, |(_, level)| *level)
     }
 
@@ -633,10 +644,11 @@ impl MarkdownCache {
     }
 
     pub(super) fn table_at(&self, source: usize) -> bool {
-        self.blocks
-            .tables
-            .iter()
-            .any(|range| range.start <= source && source < range.end)
+        let tables = &self.blocks.tables;
+        let index = tables.partition_point(|range| range.end <= source);
+        tables
+            .get(index)
+            .is_some_and(|range| range.contains(&source))
     }
 
     pub(super) fn project_with_rows(
@@ -866,10 +878,11 @@ pub(super) fn shape_lines(
             start = run_end;
             index += 1;
         }
+        let source = map.to_source(offset);
         let heading = if logical.is_empty() {
             0
         } else {
-            cache.heading_at(map.to_source(offset))
+            cache.heading_at(source)
         };
         let (font_size, line_height) = if heading > 0 {
             let (font_size, line_height) = metrics.heading(heading);
@@ -881,7 +894,7 @@ pub(super) fn shape_lines(
             logical.to_owned().into(),
             font_size,
             &local_runs,
-            (!cache.table_at(map.to_source(offset))).then_some(width),
+            (!cache.table_at(source)).then_some(width),
             None,
         ) {
             for line in shaped {
@@ -898,6 +911,40 @@ pub(super) fn shape_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn indexed_projection_preserves_boundaries_for_hidden_and_inserted_text() {
+        let projection = Projection::from_edits(
+            "abXXcdef",
+            vec![
+                Edit {
+                    range: 2..4,
+                    text: String::new(),
+                },
+                Edit {
+                    range: 5..5,
+                    text: "!".to_owned(),
+                },
+                Edit {
+                    range: 6..7,
+                    text: "β".to_owned(),
+                },
+            ],
+        );
+        assert_eq!(projection.text.as_ref(), "abc!dβf");
+        assert_eq!(
+            (0..=8)
+                .map(|offset| projection.to_display(offset))
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 2, 2, 3, 5, 7, 8]
+        );
+        assert_eq!(
+            (0..=8)
+                .map(|offset| projection.to_source(offset))
+                .collect::<Vec<_>>(),
+            [0, 1, 4, 5, 5, 6, 6, 7, 8]
+        );
+    }
 
     fn runs(source: &str, marked: Option<&Range<usize>>) -> Vec<TextRun> {
         MarkdownCache::default().runs(

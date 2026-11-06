@@ -77,7 +77,7 @@ if (await run('git', ['apply', '--reverse', '--check', ...patchArgs], true)) {
 	await checked('git', ['apply', '--check', ...patchArgs]);
 	await checked('git', ['apply', ...patchArgs]);
 }
-for (const name of ['markdown_input.rs', 'markdown_blocks.rs', 'markdown_syntax.rs']) {
+for (const name of ['file_buffer.rs', 'markdown_input.rs', 'markdown_blocks.rs', 'markdown_syntax.rs']) {
 	const moduleSource = join(projectRoot, 'native', name);
 	const moduleDestination = join(sourceRoot, 'packages/native/src/custom_elements', name);
 	if (!(await exists(moduleDestination)) || !(await readFile(moduleSource)).equals(await readFile(moduleDestination))) {
