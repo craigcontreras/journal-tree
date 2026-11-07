@@ -10,6 +10,8 @@ render_hot(new URL('./App.svelte', import.meta.url), {
 	titlebarTransparent: true,
 	trafficLightX: 16,
 	trafficLightY: 19,
+	windowBackground: "transparent",
+	transparent: true
 });
 
 //GPUIX-svelte doesn't call exit handlers!!!!

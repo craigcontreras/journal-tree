@@ -16,6 +16,29 @@
 	let response = $state(null);
 
 	const activeNote = $derived(fileState.files.find(file => file.path === fileState.activePath) ?? editorState);
+	
+	$effect(() => {
+		console.log(activeNote);
+	})
+
+	function closeFile(index: number) {
+		//TODO: saving to disk
+
+		if (fileState.activePath !== fileState.files[index].path) {
+			console.log(fileState.activePath !== fileState.files[index].path);
+			console.log(fileState.activePath);
+			console.log(fileState.files[index].path);
+			fileState.files.splice(index, 1);
+			return;
+		}
+
+		if (index + 1 in fileState.files) {
+			fileState.activePath = fileState.files[index + 1].path;
+		} else if (index - 1 in fileState.files) {
+			fileState.activePath = fileState.files[index - 1].path;
+		}
+		fileState.files.splice(index, 1);
+	}
 
 	onMount(() => {
 		let opening = false;
@@ -27,7 +50,7 @@
 					files: true,
 					directories: false,
 					multiple: true,
-					prompt: "Select"
+					prompt: "Open"
 				});
 				if (paths) await openFiles(paths);
 			} catch (error) {
@@ -54,9 +77,9 @@
 
 <div class="app">
 	<div class="menubar-row" testid="menubar-row" hitbox="self">
-		<div class="side-menubar"></div>
+		<div class="side-menubar" style="visibility: hidden;"></div>
 		<div class="sidebar-spacer"></div>
-		<FileTabs files={fileState.files} activePath={fileState.activePath} onSelect={selectFile} />
+		<FileTabs files={fileState.files} activePath={fileState.activePath} onSelect={selectFile} onClose={closeFile} />
 		<div class="sidebar-spacer"></div>
 	</div>
 	<div class="workspace" testid="workspace">
@@ -81,6 +104,7 @@
 	.side-menubar {
 		width: 4rem;
 		flex-shrink: 0;
+		background-color: rgb(17, 17, 27, 0.9);
 	}
 
 	.sidebar-spacer {
@@ -96,6 +120,7 @@
 		width: 15%;
 		height: 100%;
 		flex-shrink: 0;
+		background-color: rgb(17, 17, 27);
 	}
 
 	.app {
@@ -103,7 +128,6 @@
 		flex-direction: column;
 		width: 100%;
 		height: 100%;
-		background-color: var(--surface);
 	}
 
 	.menubar-row {
@@ -115,6 +139,7 @@
 		flex-shrink: 0;
 		border-bottom-width: 2px;
 		border-color: var(--divider);
+		background-color: rgb(17, 17, 27, 0.9);
 	}
 
 	.workspace {
