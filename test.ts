@@ -17,7 +17,7 @@ check('menubar spans the workspace', header.width, workspace.width);
 // Native bounds omit the menubar's 2px bottom border.
 check('workspace begins below the menubar divider', workspace.y, header.y + header.height + 2);
 check('sidebar divider stays below the window controls', sidebar.y, workspace.y);
-check('tab sits close to the editor edge', tabStrip.x, editorColumn.x + 8);
+check('tab sits close to the editor edge', tabStrip.x, editorColumn.x);
 
 if (process.env.GPUIX_SCREENSHOT) screenshot(process.env.GPUIX_SCREENSHOT);
 
